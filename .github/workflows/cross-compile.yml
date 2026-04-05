@@ -42,18 +42,15 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          # Download ripgrep after build
+          bun run scripts/download-ripgrep.ts || true
 
       - name: Build
         run: |
           bun run build
-          # For cross-compilation, download target platform's bun and use it
-          BUN_VERSION=$(bun --version)
-          BUN_PLATFORM="${{ matrix.target }}"
-          curl -sL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-${BUN_PLATFORM}.zip" -o /tmp/bun-${BUN_PLATFORM}.zip
-          unzip -j /tmp/bun-${BUN_PLATFORM}.zip "bun-${BUN_PLATFORM}/bun" -d /tmp/bun-target
-          chmod +x /tmp/bun-target/bun
-          bun build dist/cli.js --compile --compile-executable-path=/tmp/bun-target/bun --outfile=claude-code
+          bun build dist/cli.js --compile --outfile=claude-code
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
