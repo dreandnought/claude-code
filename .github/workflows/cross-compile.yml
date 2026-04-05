@@ -47,30 +47,16 @@ jobs:
       - name: Build
         run: |
           bun run build
-          bun build dist/cli.js --compile --target=${{ matrix.target }} --outfile=claude-code-${{ matrix.target }}
-        env:
-          TARGET_PLATFORM: ${{ matrix.target }}
+          # For cross-compilation, download target platform's bun and use it
+          BUN_VERSION=$(bun --version)
+          BUN_PLATFORM="${{ matrix.target }}"
+          curl -sL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-${BUN_PLATFORM}.zip" -o /tmp/bun-${BUN_PLATFORM}.zip
+          unzip -j /tmp/bun-${BUN_PLATFORM}.zip "bun-${BUN_PLATFORM}/bun" -d /tmp/bun-target
+          chmod +x /tmp/bun-target/bun
+          bun build dist/cli.js --compile --compile-executable-path=/tmp/bun-target/bun --outfile=claude-code
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: claude-code-${{ matrix.target }}
-          path: claude-code-${{ matrix.target }}
-
-  release:
-    needs: build
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: artifacts/*
-          draft: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          path: claude-code
