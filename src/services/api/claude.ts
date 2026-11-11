@@ -66,6 +66,8 @@ import {
 import { getOrCreateUserID } from '../../utils/config.js'
 import {
   CAPPED_DEFAULT_MAX_TOKENS,
+  clampMaxOutputTokensToWindow,
+  estimateTokensFromPayload,
   getModelMaxOutputTokens,
   getSonnet1mExpTreatmentEnabled,
 } from '../../utils/context.js'
@@ -1676,6 +1678,19 @@ async function* queryModel(
       options.maxOutputTokensOverride ||
       getMaxOutputTokensForModel(options.model)
 
+    // Never request more output than the window has room for. Endpoints that
+    // count input + max_tokens against the limit reject the whole request as
+    // "input too large" otherwise, even when the input alone would fit.
+    const clampedMaxOutputTokens = clampMaxOutputTokensToWindow(
+      options.model,
+      maxOutputTokens,
+      estimateTokensFromPayload({
+        system,
+        messages: messagesForAPI,
+        tools: allTools,
+      }),
+    )
+
     const hasThinking =
       thinkingConfig.type !== 'disabled' &&
       !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING)
@@ -1801,7 +1816,7 @@ async function* queryModel(
       tool_choice: options.toolChoice,
       ...(useBetas && { betas: filteredBetas }),
       metadata: getAPIMetadata(),
-      max_tokens: maxOutputTokens,
+      max_tokens: clampedMaxOutputTokens,
       thinking,
       ...(temperature !== undefined && { temperature }),
       ...(contextManagement &&

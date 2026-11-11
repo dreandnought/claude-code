@@ -1,6 +1,6 @@
 import type { ChildProcess, ExecFileException } from 'child_process'
 import { execFile, spawn } from 'child_process'
-import { existsSync } from 'fs'
+import { chmodSync, existsSync, mkdirSync, renameSync, writeFileSync } from 'fs'
 import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
 import * as path from 'path'
@@ -14,6 +14,10 @@ import { findExecutable } from './findExecutable.js'
 import { logError } from './log.js'
 import { getPlatform } from './platform.js'
 import { countCharInString } from './stringUtils.js'
+import {
+  EMBEDDED_RG_BASE64,
+  EMBEDDED_RG_PLATFORM,
+} from './vendor/embeddedRg.js'
 
 const __dirname = (() => {
   if (process.env.NODE_ENV === 'test') return path.resolve(distRoot)
@@ -27,6 +31,42 @@ type RipgrepConfig = {
   argv0?: string
   note?: string
 }
+
+/**
+ * Extract the ripgrep binary baked into a standalone executable.
+ *
+ * Single-file builds have no `vendor/` directory next to them, so the binary
+ * is shipped inside the executable as base64 and unpacked once into the user
+ * cache dir. Returns undefined for normal installs (empty payload).
+ */
+const resolveEmbeddedRipgrep = memoize((): string | undefined => {
+  if (!EMBEDDED_RG_BASE64) return undefined
+  const platformKey = `${process.platform}-${process.arch}`
+  if (EMBEDDED_RG_PLATFORM && EMBEDDED_RG_PLATFORM !== platformKey) {
+    // Payload built for another platform (cross-compiled binary run elsewhere).
+    return undefined
+  }
+  const fileName = process.platform === 'win32' ? 'rg.exe' : 'rg'
+  const cacheKey = `${platformKey}-${EMBEDDED_RG_BASE64.length}`
+  const dir = path.join(homedir(), '.cache', 'ccb', 'ripgrep', cacheKey)
+  const target = path.join(dir, fileName)
+  try {
+    if (existsSync(target)) {
+      return target
+    }
+    mkdirSync(dir, { recursive: true })
+    const tmp = `${target}.${process.pid}.tmp`
+    writeFileSync(tmp, Buffer.from(EMBEDDED_RG_BASE64, 'base64'))
+    try {
+      chmodSync(tmp, 0o755)
+    } catch {}
+    renameSync(tmp, target)
+    return target
+  } catch (error) {
+    logError(error instanceof Error ? error : new Error(String(error)))
+    return undefined
+  }
+})
 
 export const getRipgrepConfig = memoize((): RipgrepConfig => {
   const userWantsSystemRipgrep = isEnvDefinedFalsy(
@@ -42,6 +82,13 @@ export const getRipgrepConfig = memoize((): RipgrepConfig => {
       // Using just 'rg' lets the OS resolve it safely with NoDefaultCurrentDirectoryInExePath protection
       return { mode: 'system', command: 'rg', args: [] }
     }
+  }
+
+  // Standalone single-file build: unpack the embedded binary instead of
+  // relying on a vendor/ dir that does not exist next to the executable.
+  const embeddedPath = resolveEmbeddedRipgrep()
+  if (embeddedPath) {
+    return { mode: 'builtin', command: embeddedPath, args: [] }
   }
 
   // In bundled (native) mode, ripgrep is statically compiled into bun-internal

@@ -326,6 +326,42 @@ export const SettingsSchema = lazySchema(() =>
       env: EnvironmentVariablesSchema()
         .optional()
         .describe('Environment variables to set for Claude Code sessions'),
+      /**
+       * Per-model effective context window overrides, in tokens.
+       *
+       * Used for LOCAL decisions only (auto-compact threshold, /context
+       * percentage, blocking limit, attachment budgets). Nothing here is sent
+       * to the API — it tells Claude Code how much room the endpoint really
+       * has, so compaction fires at the right time for models that are not
+       * 200k (e.g. 131072 / 262144).
+       *
+       * Keys are matched against the model id: exact match wins, otherwise the
+       * longest key contained in the id wins (case-insensitive).
+       */
+      modelContextWindows: z
+        .record(z.string(), z.coerce.number().int().min(4_096).max(10_000_000))
+        .optional()
+        .describe(
+          'Per-model context window overrides in tokens, e.g. ' +
+            '{"glm-4.6": 200000, "qwen3-coder": 131072}. ' +
+            'Matched case-insensitively against the model id (exact first, ' +
+            'then longest substring). Affects local auto-compact budgeting only.',
+        ),
+      /**
+       * Global cap applied to every model's effective context window. Useful to
+       * force an early compact on a large-window model (or as a safety margin
+       * when the endpoint's real limit is slightly below its advertised one).
+       */
+      maxContextTokens: z.coerce
+        .number()
+        .int()
+        .min(4_096)
+        .max(10_000_000)
+        .optional()
+        .describe(
+          'Global upper bound for the effective context window used by local ' +
+            'decisions (auto-compact, /context, blocking limit).',
+        ),
       // Attribution for commits and PRs
       attribution: z
         .object({

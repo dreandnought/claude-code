@@ -1,6 +1,7 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { CONTEXT_1M_BETA_HEADER } from '../constants/betas.js'
 import { getGlobalConfig } from './config.js'
+import { getObservedContextLimit } from './contextLimitOverride.js'
 import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { resolveAntModel } from './model/antModels.js'
@@ -9,6 +10,10 @@ import {
   getChatGPTModelContextWindow,
 } from './model/chatgptModels.js'
 import { getModelCapability } from './model/modelCapabilities.js'
+// NOTE: settingsCache.ts is type-only at runtime (zero imports), so reading the
+// merged settings snapshot from here does NOT create the
+// context → settings → growthbook → betas → context import cycle.
+import { getSessionSettingsCache } from './settings/settingsCache.js'
 
 // Model context window size (200k tokens for all models right now)
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -61,14 +66,104 @@ export function getContextWindowForModel(
   model: string,
   betas?: string[],
 ): number {
-  // Allow override via environment variable (ant-only)
-  // This takes precedence over all other context window resolution, including 1M detection,
-  // so users can cap the effective context window for local decisions (auto-compact, etc.)
-  // while still using a 1M-capable endpoint.
-  if (
-    process.env.USER_TYPE === 'ant' &&
-    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS
-  ) {
+  // 1) Per-model override from settings.json / observed server limit.
+  //    Both are "what the endpoint really has", so take the most restrictive.
+  const configured = getSettingsContextWindowOverride(model)
+  const observed = getObservedContextLimit(model)
+  let resolved: number
+  if (configured !== undefined && observed !== undefined) {
+    resolved = Math.min(configured, observed)
+  } else if (configured !== undefined) {
+    resolved = configured
+  } else if (observed !== undefined) {
+    resolved = observed
+  } else {
+    resolved = resolveContextWindowRaw(model, betas)
+  }
+
+  // 2) Optional global cap (e.g. keep a 1M model compacting at 150k).
+  const cap = getSettingsMaxContextCap()
+  if (cap !== undefined) {
+    resolved = Math.min(resolved, cap)
+  }
+  return resolved
+}
+
+const overrideMemo = new Map<string, number | undefined>()
+
+function matchModelKey(
+  map: Record<string, number>,
+  model: string,
+): number | undefined {
+  const m = model.toLowerCase()
+  const canonical = getCanonicalName(model).toLowerCase()
+  const keys = Object.keys(map).sort(
+    (a, b) => b.length - a.length || a.localeCompare(b),
+  )
+  for (const probe of canonical === m ? [m] : [m, canonical]) {
+    const exact = keys.find(k => k.toLowerCase() === probe)
+    if (exact !== undefined) return map[exact]
+  }
+  for (const probe of canonical === m ? [m] : [m, canonical]) {
+    const partial = keys.find(k => probe.includes(k.toLowerCase()))
+    if (partial !== undefined) return map[partial]
+  }
+  return undefined
+}
+
+function getSettingsContextWindowOverride(model: string): number | undefined {
+  const merged = getSessionSettingsCache()?.settings
+  const map = merged?.modelContextWindows
+  if (map) {
+    // A loaded cache always writes a value (possibly undefined) for the model,
+    // so removing the key from settings.json also clears the memo.
+    overrideMemo.set(model, matchModelKey(map, model))
+  }
+  // Cold cache / mid-reset: reuse the last known value instead of flashing
+  // back to the 200k default for one render or one compaction decision.
+  return overrideMemo.get(model)
+}
+
+function getSettingsMaxContextCap(): number | undefined {
+  return getSessionSettingsCache()?.settings?.maxContextTokens
+}
+
+/** Rough token estimate for a request payload (chars / 4). */
+export function estimateTokensFromPayload(payload: unknown): number {
+  try {
+    const json = typeof payload === 'string' ? payload : JSON.stringify(payload)
+    return Math.ceil(json.length / 4)
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Clamp an output-token budget so that `input + max_tokens` cannot exceed the
+ * model's effective context window. This is the main defense against
+ * "input length and max_tokens exceed context limit" / "maximum context length
+ * is N tokens" errors on OpenAI-compatible endpoints, which otherwise get a
+ * fixed 64k max_tokens request regardless of their window.
+ */
+export function clampMaxOutputTokensToWindow(
+  model: string,
+  configuredMaxTokens: number,
+  estimatedInputTokens: number,
+): number {
+  const MIN_OUTPUT_TOKENS = 512
+  const SAFETY_BUFFER_TOKENS = 1_024
+  const window = getContextWindowForModel(model)
+  if (!Number.isFinite(window) || window <= 0) return configuredMaxTokens
+  const available = window - estimatedInputTokens - SAFETY_BUFFER_TOKENS
+  if (available >= configuredMaxTokens) return configuredMaxTokens
+  return Math.max(MIN_OUTPUT_TOKENS, Math.floor(available))
+}
+
+function resolveContextWindowRaw(model: string, betas?: string[]): number {
+  // Allow override via environment variable (available to everyone; the old
+  // USER_TYPE=ant gate is intentionally removed so third-party users can cap
+  // the effective window too). This takes precedence over all detection below.
+  if (process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS) {
     const override = parseInt(process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, 10)
     if (!isNaN(override) && override > 0) {
       return override

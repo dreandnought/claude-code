@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+
+  "model": "qwen3-coder",
+
+  "modelContextWindows": {
+    "qwen3-coder": 131072,
+    "glm-4.6": 200000,
+    "kimi-k2": 262144,
+    "deepseek-v4-flash": 1000000
+  },
+
+  "maxContextTokens": 124000,
+
+  "env": {
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "111000",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80"
+  },
+
+  "cleanupPeriodDays": 30,
+  "respectGitignore": true,
+  "alwaysThinkingEnabled": true
+}

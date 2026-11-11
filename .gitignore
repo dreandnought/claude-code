@@ -56,3 +56,6 @@ credentials.json
 .test-progress.md
 .squash-tmp/
 .git.*-backup
+
+# Build artifacts (single-file binaries)
+release/

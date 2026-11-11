@@ -28,6 +28,7 @@ import {
   getDefaultMainLoopModelSetting,
   isNonCustomOpusModel,
 } from 'src/utils/model/model.js'
+import { recordObservedContextLimit } from 'src/utils/contextLimitOverride.js'
 import { getModelStrings } from 'src/utils/model/modelStrings.js'
 import { getAPIProvider } from 'src/utils/model/providers.js'
 import { getIsNonInteractiveSession } from '../../bootstrap/state.js'
@@ -74,6 +75,92 @@ export function isPromptTooLongMessage(msg: AssistantMessage): boolean {
       block.type === 'text' &&
       block.text.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE),
   )
+}
+
+/**
+ * Shapes used by non-Anthropic providers when the request exceeds the window.
+ * Matched against the raw error message (case-insensitive unless noted).
+ */
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+  // OpenAI / Azure / DeepSeek / Moonshot
+  /maximum context length is\s*\d+/i,
+  /context_length_exceeded/i,
+  /reduce the length of the messages/i,
+  /(?:prompt|input|messages?)[^.\n]{0,48}(?:is|are)?\s*too long/i,
+  /exceeds? (?:the )?(?:model'?s )?maximum (?:context|input)(?: length| window)?/i,
+  // Anthropic-style input+max_tokens overflow (already handled above, kept for
+  // completeness when the status is not 400)
+  /input length and\s*`?max_tokens`?\s*exceed/i,
+  // Qwen / DashScope: "Range of input length should be [1, 129024]"
+  /range of input length should be/i,
+  // GLM / Zhipu and other domestic providers
+  /输入(?:内容)?过长|上下文长度(?:超出|超限)|超出最大(?:上下文|长度)/,
+  // Generic token-count overflow wording
+  /token count[^.\n]{0,48}exceed/i,
+]
+
+const CONTEXT_LIMIT_PATTERNS: RegExp[] = [
+  /maximum context length is\s*(\d{4,9})/i,
+  /range of input length should be\s*\[\s*\d+\s*,\s*(\d{4,9})\s*\]/i,
+  /(?:maximum|limit|max)\.?\D{0,24}(\d{4,9})\s*tokens/i,
+  /(\d{4,9})\s*tokens?\s*>\s*(\d{4,9})/,
+]
+
+/**
+ * Pull the advertised input limit out of a provider error message.
+ * Returns undefined when the message carries no number we can trust.
+ */
+export function parseAdvertisedContextLimit(
+  message: string,
+): number | undefined {
+  for (const [index, pattern] of CONTEXT_LIMIT_PATTERNS.entries()) {
+    const match = message.match(pattern)
+    if (!match) continue
+    // "X tokens > Y maximum" → the limit is the second group
+    const raw =
+      index === CONTEXT_LIMIT_PATTERNS.length - 1 ? match[2] : match[1]
+    if (!raw) continue
+    const value = parseInt(raw, 10)
+    if (Number.isFinite(value) && value >= 4_096 && value <= 20_000_000) {
+      return value
+    }
+  }
+  return undefined
+}
+
+/**
+ * Detect a context-overflow error from any provider. Returns null when the
+ * error is unrelated (auth, rate limit, media size, ...).
+ */
+export function detectContextOverflowError(
+  error: unknown,
+): { limit?: number; detail: string } | null {
+  if (!(error instanceof Error) || !error.message) {
+    // Bare 413s still carry the status even without a useful message
+    if (error instanceof APIError && error.status === 413) {
+      return { detail: error.message ?? 'Request entity too large (413)' }
+    }
+    return null
+  }
+
+  const message = error.message
+
+  // Media-specific 413s have their own recovery path — don't hijack them.
+  if (
+    /image|media|pdf|附件|图片/i.test(message) &&
+    /too large|exceed/i.test(message)
+  ) {
+    return null
+  }
+
+  const matched = CONTEXT_OVERFLOW_PATTERNS.some(p => p.test(message))
+  const is413 = error instanceof APIError && error.status === 413
+  if (!matched && !is413) return null
+
+  return {
+    limit: parseAdvertisedContextLimit(message),
+    detail: message,
+  }
 }
 
 /**
@@ -566,10 +653,34 @@ export function getAssistantMessageFromError(
     // Content stays generic (UI matches on exact string). The raw error with
     // token counts goes into errorDetails — reactive compact's retry loop
     // parses the gap from there via getPromptTooLongTokenGap.
+    //
+    // Also record the advertised limit locally: third-party endpoints never
+    // publish it via /v1/models, and learning it here makes the NEXT turn
+    // budget correctly instead of repeating the same 413.
+    const advertised = parseAdvertisedContextLimit(error.message)
+    if (advertised !== undefined) {
+      recordObservedContextLimit(model, advertised)
+    }
     return createAssistantAPIErrorMessage({
       content: PROMPT_TOO_LONG_ERROR_MESSAGE,
       error: 'invalid_request',
       errorDetails: error.message,
+    })
+  }
+
+  // Non-Anthropic context-overflow shapes (OpenAI / Azure / DeepSeek / GLM /
+  // Qwen / Moonshot / any 413). Without this branch these errors surface as
+  // generic API errors, no recovery runs, and nothing is learned about the
+  // real window.
+  const overflow = detectContextOverflowError(error)
+  if (overflow) {
+    if (overflow.limit !== undefined) {
+      recordObservedContextLimit(model, overflow.limit)
+    }
+    return createAssistantAPIErrorMessage({
+      content: PROMPT_TOO_LONG_ERROR_MESSAGE,
+      error: 'invalid_request',
+      errorDetails: overflow.detail,
     })
   }
 

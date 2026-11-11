@@ -59,7 +59,11 @@ export {
   resolveOpenAIMaxTokens,
   buildOpenAIRequestBody,
 }
-import { getModelMaxOutputTokens } from '../../../utils/context.js'
+import {
+  clampMaxOutputTokensToWindow,
+  estimateTokensFromPayload,
+  getModelMaxOutputTokens,
+} from '../../../utils/context.js'
 import type { Options } from '../claude.js'
 import { randomUUID } from 'crypto'
 import {
@@ -346,9 +350,18 @@ export async function* queryModelOpenAI(
     //     3. CLAUDE_CODE_MAX_OUTPUT_TOKENS env var (generic override)
     //     4. upperLimit default (64000)
     const { upperLimit } = getModelMaxOutputTokens(openaiModel)
-    const maxTokens = resolveOpenAIMaxTokens(
-      upperLimit,
-      options.maxOutputTokensOverride,
+    // Clamp against the effective window: many OpenAI-compatible endpoints
+    // reject any request where input + max_tokens exceeds the window, so a
+    // fixed 64k budget fails as soon as the conversation is 70k+ tokens long
+    // on a 131k model.
+    const maxTokens = clampMaxOutputTokensToWindow(
+      openaiModel,
+      resolveOpenAIMaxTokens(upperLimit, options.maxOutputTokensOverride),
+      estimateTokensFromPayload({
+        system: systemPrompt,
+        messages: openaiMessages,
+        tools: openaiTools,
+      }),
     )
 
     const useChatGPTResponses = isChatGPTAuthEnabled()

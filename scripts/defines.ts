@@ -46,6 +46,9 @@ export const DEFAULT_BUILD_FEATURES = [
   'SHOT_STATS', // 单次请求统计信息收集
   'PROMPT_CACHE_BREAK_DETECTION', // 检测 prompt cache 是否被打破（有 10 条上限，可控）
   'TOKEN_BUDGET', // Token 预算管理与控制
+  // 413 / prompt-too-long 自动恢复：命中后压缩一次并重试。
+  // 原本是 ant-only，外部构建缺少 413 兜底，小窗口第三方模型一旦超限只能手动 /compact。
+  'REACTIVE_COMPACT',
   // P0: local features
   'AGENT_TRIGGERS', // 本地 Agent 触发器（工具调用时启动子代理）
   'ULTRATHINK', // 超深度思考模式，增加推理链长度
