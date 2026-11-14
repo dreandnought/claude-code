@@ -181,6 +181,21 @@ describe('PermissionsSchema', () => {
     })
     expect(result.success).toBe(true)
   })
+
+  test('accepts denyInsteadOfPrompting', () => {
+    const result = PermissionsSchema().safeParse({
+      denyInsteadOfPrompting: true,
+    })
+    expect(result.success).toBe(true)
+  })
+
+  test('accepts working directory boundaries', () => {
+    const result = PermissionsSchema().safeParse({
+      blockReadsOutsideWorkingDirectories: true,
+      blockWritesOutsideWorkingDirectories: true,
+    })
+    expect(result.success).toBe(true)
+  })
 })
 
 // ─── AllowedMcpServerEntrySchema ────────────────────────────────────────

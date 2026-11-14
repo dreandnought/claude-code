@@ -57,11 +57,22 @@ declare const MACRO: { VERSION: string }
 export const DANGEROUS_FILES = [
   '.gitconfig',
   '.gitmodules',
+  '.git-credentials',
   '.bashrc',
   '.bash_profile',
+  '.bash_login',
+  '.bash_logout',
   '.zshrc',
+  '.zshenv',
+  '.zlogin',
+  '.zlogout',
   '.zprofile',
   '.profile',
+  '.cshrc',
+  '.kshrc',
+  '.netrc',
+  '.npmrc',
+  '.pypirc',
   '.ripgreprc',
   '.mcp.json',
   '.claude.json',
@@ -77,6 +88,15 @@ export const DANGEROUS_DIRECTORIES = [
   '.idea',
   '.claude',
 ] as const
+
+/**
+ * Directory pairs whose contents are protected regardless of location, e.g.
+ * `~/.config/git/` holds git config and credential helpers that execute on
+ * every git invocation.
+ */
+export const DANGEROUS_DIRECTORY_PAIRS: ReadonlyArray<
+  readonly [string, string]
+> = [['.config', 'git']]
 
 /**
  * Normalizes a path for case-insensitive comparison.
@@ -478,6 +498,21 @@ function isDangerousFilePathToAutoEdit(path: string): boolean {
       (DANGEROUS_FILES as readonly string[]).some(
         dangerousFile =>
           normalizeCaseForComparison(dangerousFile) === normalizedFileName,
+      )
+    ) {
+      return true
+    }
+  }
+
+  // Check for dangerous directory pairs, e.g. ~/.config/git/
+  for (let i = 0; i < pathSegments.length - 1; i++) {
+    const current = normalizeCaseForComparison(pathSegments[i]!)
+    const next = normalizeCaseForComparison(pathSegments[i + 1]!)
+    if (
+      DANGEROUS_DIRECTORY_PAIRS.some(
+        ([first, second]) =>
+          normalizeCaseForComparison(first) === current &&
+          normalizeCaseForComparison(second) === next,
       )
     ) {
       return true

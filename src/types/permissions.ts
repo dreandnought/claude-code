@@ -439,4 +439,16 @@ export type ToolPermissionContext = {
   readonly shouldAvoidPermissionPrompts?: boolean
   readonly awaitAutomatedChecksBeforeDialog?: boolean
   readonly prePlanMode?: PermissionMode
+  /**
+   * Deny permission requests instead of prompting for them. Set from
+   * `permissions.denyInsteadOfPrompting` in settings or from
+   * `--permission-prompts none`. Unlike the `dontAsk` permission mode this
+   * only disables the prompt — permission rules, safety checks and mode
+   * evaluation keep running, and only the final "ask" becomes "deny".
+   */
+  readonly denyInsteadOfPrompting?: boolean
+  /** Block reads outside the working directory, in every permission mode. */
+  readonly blockReadsOutsideWorkingDirectories?: boolean
+  /** Block writes outside the working directory, in every permission mode. */
+  readonly blockWritesOutsideWorkingDirectories?: boolean
 }

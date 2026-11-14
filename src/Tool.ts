@@ -126,6 +126,18 @@ export type ToolPermissionContext = DeepImmutable<{
   awaitAutomatedChecksBeforeDialog?: boolean
   /** Stores the permission mode before model-initiated plan mode entry, so it can be restored on exit */
   prePlanMode?: PermissionMode
+  /**
+   * Deny permission requests instead of prompting for them. Set from
+   * `permissions.denyInsteadOfPrompting` in settings or from
+   * `--permission-prompts none`. Unlike the `dontAsk` permission mode this
+   * only disables the prompt — permission rules, safety checks and mode
+   * evaluation keep running, and only the final "ask" becomes "deny".
+   */
+  denyInsteadOfPrompting?: boolean
+  /** Block reads outside the working directory, in every permission mode. */
+  blockReadsOutsideWorkingDirectories?: boolean
+  /** Block writes outside the working directory, in every permission mode. */
+  blockWritesOutsideWorkingDirectories?: boolean
 }>
 
 export const getEmptyToolPermissionContext: () => ToolPermissionContext =

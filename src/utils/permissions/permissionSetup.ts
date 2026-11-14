@@ -876,6 +876,7 @@ export async function initializeToolPermissionContext({
   permissionMode,
   allowDangerouslySkipPermissions: _allowDangerouslySkipPermissions,
   addDirs,
+  permissionPrompts,
 }: {
   allowedToolsCli: string[]
   disallowedToolsCli: string[]
@@ -883,6 +884,8 @@ export async function initializeToolPermissionContext({
   permissionMode: PermissionMode
   allowDangerouslySkipPermissions: boolean
   addDirs: string[]
+  /** CLI value for --permission-prompts. 'none' denies instead of prompting. */
+  permissionPrompts?: 'ask' | 'none'
 }): Promise<{
   toolPermissionContext: ToolPermissionContext
   warnings: string[]
@@ -971,6 +974,18 @@ export async function initializeToolPermissionContext({
       alwaysDenyRules: { cliArg: parsedDisallowedToolsCli },
       alwaysAskRules: {},
       isBypassPermissionsModeAvailable,
+      // Unattended runs: no one can answer a prompt, so an "ask" becomes a
+      // "deny" instead of hanging the turn. The CLI flag wins over settings
+      // only in the "none" direction — an explicit --permission-prompts ask
+      // re-enables prompting.
+      denyInsteadOfPrompting:
+        permissionPrompts === 'none' ||
+        (permissionPrompts !== 'ask' &&
+          settings.permissions?.denyInsteadOfPrompting === true),
+      blockReadsOutsideWorkingDirectories:
+        settings.permissions?.blockReadsOutsideWorkingDirectories === true,
+      blockWritesOutsideWorkingDirectories:
+        settings.permissions?.blockWritesOutsideWorkingDirectories === true,
       ...(feature('TRANSCRIPT_CLASSIFIER')
         ? { isAutoModeAvailable: true }
         : {}),

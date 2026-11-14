@@ -54,6 +54,7 @@ import {
   type PermissionRuleFromEditableSettings,
   shouldAllowManagedPermissionRulesOnly,
 } from './permissionsLoader.js'
+import { checkWorkingDirectoryBoundary } from './workingDirectoryBoundary.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const classifierDecisionModule = feature('TRANSCRIPT_CLASSIFIER')
@@ -87,6 +88,7 @@ import {
   buildClassifierUnavailableMessage,
   buildYoloRejectionMessage,
   DONT_ASK_REJECT_MESSAGE,
+  NO_PROMPTS_REJECT_MESSAGE,
 } from '../messages.js'
 import { calculateCostFromTokens } from '../modelCost.js'
 /* eslint-enable @typescript-eslint/no-require-imports */
@@ -512,6 +514,20 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
           mode: 'dontAsk',
         },
         message: DONT_ASK_REJECT_MESSAGE(tool.name),
+      }
+    }
+
+    // Unattended runs: nobody can answer a prompt, so the request is denied
+    // instead of hanging the turn. Permission rules, safety checks and mode
+    // evaluation already ran above — only the final "ask" is rewritten.
+    if (appState.toolPermissionContext.denyInsteadOfPrompting === true) {
+      return {
+        behavior: 'deny',
+        decisionReason: {
+          type: 'other',
+          reason: 'permission prompts are disabled',
+        },
+        message: NO_PROMPTS_REJECT_MESSAGE(tool.name),
       }
     }
     // Apply auto mode: use AI classifier instead of prompting user
@@ -1183,6 +1199,18 @@ async function hasPermissionsToUseToolInner(
 ): Promise<PermissionDecision> {
   if (context.abortController.signal.aborted) {
     throw new AbortError()
+  }
+
+  // Hard deployment boundaries are evaluated before any rule, mode or
+  // bypass handling: they describe the machine's exposure, not the user's
+  // intent, so `bypassPermissions` must not widen them.
+  const boundaryDecision = checkWorkingDirectoryBoundary(
+    tool,
+    input,
+    context.getAppState().toolPermissionContext,
+  )
+  if (boundaryDecision) {
+    return boundaryDecision
   }
 
   let appState = context.getAppState()

@@ -1316,6 +1316,14 @@ async function run(): Promise<CommanderCommand> {
         .argParser(String)
         .choices(PERMISSION_MODES),
     )
+    .addOption(
+      new Option(
+        '--permission-prompts <mode>',
+        'How to handle permission requests: "ask" (default) or "none" to deny them instead of prompting (for unattended runs)',
+      )
+        .argParser(String)
+        .choices(['ask', 'none']),
+    )
     .option('-c, --continue', 'Continue the most recent conversation in the current directory', () => true)
     .option(
       '-r, --resume [value]',
@@ -1523,6 +1531,7 @@ async function run(): Promise<CommanderCommand> {
         disallowedTools = [],
         mcpConfig = [],
         permissionMode: permissionModeCli,
+        permissionPrompts: permissionPromptsCli,
         addDir = [],
         fallbackModel,
         betas = [],
@@ -2217,6 +2226,7 @@ async function run(): Promise<CommanderCommand> {
         permissionMode,
         allowDangerouslySkipPermissions,
         addDirs: addDir,
+        permissionPrompts: permissionPromptsCli,
       });
       let toolPermissionContext = initResult.toolPermissionContext;
       const { warnings, dangerousPermissions, overlyBroadBashPermissions } = initResult;

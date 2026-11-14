@@ -238,6 +238,9 @@ export function AUTO_REJECT_MESSAGE(toolName: string): string {
 export function DONT_ASK_REJECT_MESSAGE(toolName: string): string {
   return `Permission to use ${toolName} has been denied because Claude Code is running in don't ask mode. ${DENIAL_WORKAROUND_GUIDANCE}`
 }
+export function NO_PROMPTS_REJECT_MESSAGE(toolName: string): string {
+  return `Permission to use ${toolName} has been denied because permission prompts are disabled. ${DENIAL_WORKAROUND_GUIDANCE}`
+}
 export const NO_RESPONSE_REQUESTED = 'No response requested.'
 
 // Synthetic tool_result content inserted by ensureToolResultPairing when a

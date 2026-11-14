@@ -73,6 +73,24 @@ export const PermissionsSchema = lazySchema(() =>
         .array(z.string())
         .optional()
         .describe('Additional directories to include in the permission scope'),
+      denyInsteadOfPrompting: z
+        .boolean()
+        .optional()
+        .describe(
+          'Deny permission requests instead of prompting for them. Use for unattended runs where nobody can answer a prompt — the turn continues and the model can pick another route.',
+        ),
+      blockReadsOutsideWorkingDirectories: z
+        .boolean()
+        .optional()
+        .describe(
+          'Block reads outside the working directory. Applies in every permission mode, including bypassPermissions.',
+        ),
+      blockWritesOutsideWorkingDirectories: z
+        .boolean()
+        .optional()
+        .describe(
+          'Block writes outside the working directory. Applies in every permission mode, including bypassPermissions.',
+        ),
     })
     .passthrough(),
 )
