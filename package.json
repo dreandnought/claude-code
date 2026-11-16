@@ -55,6 +55,8 @@
     "check:fix": "biome check --fix .",
     "prepare": "husky",
     "test": "bun test",
+    "test:smoke": "bun test tests/smoke/",
+    "test:smoke:perf": "CCB_SMOKE_PERF_VERBOSE=1 bun test tests/smoke/perf-baseline.test.ts",
     "test:production": "bun run scripts/production-test.ts",
     "test:production:offline": "bun run scripts/production-test.ts --offline",
     "test:production:verbose": "bun run scripts/production-test.ts --verbose",
