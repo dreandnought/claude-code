@@ -1,5 +1,7 @@
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk'
 import { randomUUID } from 'crypto'
+import type { QuerySource } from 'src/constants/querySource.js'
+import { withQueueHints, type QueueHandle } from './vllmQueue/gate.js'
 import type { GoogleAuth } from 'google-auth-library'
 import {
   checkAndRefreshOAuthTokenIfNeeded,
@@ -384,6 +386,33 @@ function buildFetch(
     } catch {
       // never let logging crash the fetch
     }
-    return inner(input, { ...init, headers })
+    // vLLM 排队提示（anthropic 路径，与 openai 路径同款包装）：请求发出前
+    // 启动 gate 观察，响应头到达=服务端已受理（排队结束）立即 dispose。
+    // 非本机 ANTHROPIC_BASE_URL / queueDisplay=off / 后台请求在 gate 入口
+    // 短路，这里零开销。官方 api.anthropic.com 永远非 RFC1918，零触碰。
+    let queueHandle: QueueHandle | null = null
+    try {
+      const reqUrl = input instanceof Request ? input.url : String(input ?? '')
+      // source 缺失 = 辅助调用（token估算/能力探测/限额查询），一律不挂 gate；
+      // 主查询在 claude.ts 永远传 querySource。这里从严于 visibility 表的
+      // undefined→前台 默认，因为 buildFetch 处于更低一层。
+      if (reqUrl && source !== undefined) {
+        const u = new URL(reqUrl)
+        queueHandle = withQueueHints({
+          baseUrl: `${u.protocol}//${u.host}`,
+          querySource: source as QuerySource,
+        })
+      }
+    } catch {
+      // gate 启动异常绝不能影响主请求
+      queueHandle = null
+    }
+    const result = inner(input, { ...init, headers })
+    if (queueHandle) {
+      const h = queueHandle
+      // 响应头到达即销卡；流式 body 读取不影响（排队在头之前已结束）。
+      void Promise.resolve(result).finally(() => h.dispose())
+    }
+    return result
   }
 }

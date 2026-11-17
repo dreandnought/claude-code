@@ -43,8 +43,11 @@ OpenAI 兼容 baseUrl；公共 API（含反代公网域名）零触碰。
 | `gate.ts` | 请求级编排（接线入口 `withQueueHints`） | 组合 |
 | `statusStore.ts` | QueueStatus 发布订阅（服务层→UI） | 进程内 |
 
-接线点：
-- `src/services/api/openai/index.ts` queryModelOpenAI fetch 前挂 gate、响应头到达 dispose
+接线点（双协议）：
+- OpenAI 兼容：`src/services/api/openai/index.ts` queryModelOpenAI fetch 前挂 gate、响应头到达 dispose
+- Anthropic 原生（vLLM 根路径 /v1/messages）：`src/services/api/client.ts` buildFetch 内
+  按实际请求 URL 挂 gate；官方 api.anthropic.com 非 RFC1918 永远零触碰；
+  Bedrock/Vertex 不经过 buildFetch，零接线零副作用
 - `src/screens/REPL.tsx` `useQueueStatusLine(isLoading)` → spinner overrideMessage
   （hooks/compact 的显式 spinnerMessage 优先）
 
@@ -70,10 +73,11 @@ OpenAI 兼容 baseUrl；公共 API（含反代公网域名）零触碰。
 ## 测试
 
 ```bash
-bun test tests/smoke/vllm-queue-metrics.test.ts      # 解析层 12
-bun test tests/smoke/vllm-queue-probe.test.ts        # 探测层 12
-bun test tests/smoke/vllm-queue-model.test.ts        # 估算/显示/编排 25
-bun test tests/smoke/vllm-queue-acceptance.test.ts   # 验收钉死 8
+bun test tests/smoke/vllm-queue-metrics.test.ts       # 解析层 12
+bun test tests/smoke/vllm-queue-probe.test.ts         # 探测层 12
+bun test tests/smoke/vllm-queue-model.test.ts         # 估算/显示/编排 25
+bun test tests/smoke/vllm-queue-acceptance.test.ts    # 验收钉死 8
+bun test tests/smoke/vllm-queue-anthropic.test.ts     # anthropic 路径接线 4
 ```
 
 真实 vLLM 联调（4 变体：正常/disable-log-stats/旧指标名/鉴权反代）由几爹爹
