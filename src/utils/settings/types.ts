@@ -380,6 +380,43 @@ export const SettingsSchema = lazySchema(() =>
           'Global upper bound for the effective context window used by local ' +
             'decisions (auto-compact, /context, blocking limit).',
         ),
+      /**
+       * 排队显示总开关（vLLM queue hints, 方案 v2.1 §6）。
+       * off：全链路短路（零轮询/零落盘/零事件），与基线行为一致；
+       * vllm：仅对 OpenAI 兼容 + 本机/RFC1918 baseUrl 生效，端点探不到
+       *       /metrics 时静默降级为零显示。
+       * 非法值在 settings 校验层直接报错。
+       */
+      queueDisplay: z
+        .enum(['off', 'vllm'])
+        .optional()
+        .describe(
+          'Queue hint display mode for local vLLM-compatible endpoints. ' +
+            '"off" disables the whole pipeline (zero overhead); "vllm" (default) ' +
+            'shows rank/ETA hints for foreground requests blocked on a queue.',
+        ),
+      /**
+       * 排队提示明细参数（仅 queueDisplay="vllm" 时读取；off 时整块不解析）。
+       * calibration 自观测样本仅含时长与计数，不含请求内容。
+       */
+      vllmQueueHints: z
+        .object({
+          pollMs: z.coerce.number().int().min(200).max(60_000).optional(),
+          thresholdMs: z.coerce.number().int().min(0).max(120_000).optional(),
+          showEta: z.boolean().optional(),
+          uncertaintyHints: z.boolean().optional(),
+          calibration: z.boolean().optional(),
+          maxLocalConcurrency: z.coerce
+            .number()
+            .int()
+            .min(0)
+            .max(64)
+            .optional(),
+        })
+        .optional()
+        .describe(
+          'Tuning for vLLM queue hints (read only when queueDisplay="vllm").',
+        ),
       // Attribution for commits and PRs
       attribution: z
         .object({
