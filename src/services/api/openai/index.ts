@@ -65,6 +65,7 @@ import {
   getModelMaxOutputTokens,
 } from '../../../utils/context.js'
 import type { Options } from '../claude.js'
+import { withQueueHints } from '../vllmQueue/gate.js'
 import { randomUUID } from 'crypto'
 import {
   createAssistantAPIErrorMessage,
@@ -383,6 +384,15 @@ export async function* queryModelOpenAI(
     // 11. Call OpenAI API with streaming. ChatGPT subscription auth uses the
     // Codex Responses backend; API-key/OpenAI-compatible auth keeps the
     // existing Chat Completions adapter.
+    // vLLM 排队提示（方案 v2.1 批次3）：请求发出前启动 gate 观察；响应头
+    // 到达=服务端已受理（排队结束），立即 dispose 撕行。off/非本机/后台请求
+    // 在 withQueueHints 入口即短路，这里零开销。队列期恰在 fetch 挂起窗口内。
+    const queueBaseUrl =
+      process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+    const queueHandle = withQueueHints({
+      baseUrl: queueBaseUrl,
+      querySource: options.querySource,
+    })
     const adaptedStream = useChatGPTResponses
       ? adaptResponsesStreamToAnthropic(
           await createChatGPTResponsesStream({
@@ -396,7 +406,7 @@ export async function* queryModelOpenAI(
             }),
             signal,
             fetchOverride: options.fetchOverride as unknown as typeof fetch,
-          }),
+          }).finally(() => queueHandle.dispose()),
           openaiModel,
         )
       : adaptOpenAIStreamToAnthropic(
@@ -404,19 +414,21 @@ export async function* queryModelOpenAI(
             maxRetries: 0,
             fetchOverride: options.fetchOverride as unknown as typeof fetch,
             source: options.querySource,
-          }).chat.completions.create(
-            buildOpenAIRequestBody({
-              model: openaiModel,
-              messages: openaiMessages,
-              tools: openaiTools,
-              toolChoice: openaiToolChoice,
-              enableThinking,
-              maxTokens,
-              temperatureOverride: options.temperatureOverride,
-              promptCacheKey,
-            }),
-            { signal },
-          ),
+          })
+            .chat.completions.create(
+              buildOpenAIRequestBody({
+                model: openaiModel,
+                messages: openaiMessages,
+                tools: openaiTools,
+                toolChoice: openaiToolChoice,
+                enableThinking,
+                maxTokens,
+                temperatureOverride: options.temperatureOverride,
+                promptCacheKey,
+              }),
+              { signal },
+            )
+            .finally(() => queueHandle.dispose()),
           openaiModel,
           { includeCacheWriteTokens: useOfficialOpenAICache },
         )

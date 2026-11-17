@@ -111,6 +111,7 @@ import {
 } from '../utils/swarm/leaderPermissionBridge.js';
 import { endInteractionSpan } from '../utils/telemetry/sessionTracing.js';
 import { useLogMessages } from '../hooks/useLogMessages.js';
+import { useQueueStatusLine } from '../hooks/useQueueStatusLine.js';
 import { useReplBridge } from '../hooks/useReplBridge.js';
 import {
   type Command,
@@ -1806,6 +1807,9 @@ export function REPL({
 
   const [lastQueryCompletionTime, setLastQueryCompletionTime] = useState(0);
   const [spinnerMessage, setSpinnerMessage] = useState<string | null>(null);
+  // vLLM 排队提示（方案 v2.1 批次3）：仅 loading 期间接管 spinner 文案，
+  // hooks/compact 等显式 spinnerMessage 优先。
+  const queueStatusLine = useQueueStatusLine(isLoading);
   const [spinnerColor, setSpinnerColor] = useState<keyof Theme | null>(null);
   const [spinnerShimmerColor, setSpinnerShimmerColor] = useState<keyof Theme | null>(null);
   const [isMessageSelectorVisible, setIsMessageSelectorVisible] = useState(false);
@@ -5957,7 +5961,7 @@ export function REPL({
                   responseLengthRef={responseLengthRef}
                   apiMetricsRef={apiMetricsRef}
                   compactProgressActiveRef={compactProgressActiveRef}
-                  overrideMessage={spinnerMessage}
+                  overrideMessage={spinnerMessage ?? queueStatusLine}
                   spinnerSuffix={stopHookSpinnerSuffix}
                   verbose={verbose}
                   loadingStartTimeRef={loadingStartTimeRef}

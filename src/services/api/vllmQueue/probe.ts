@@ -165,6 +165,19 @@ export function endpointKeyOf(baseUrl: string): string {
   }
 }
 
+/**
+ * vLLM 的 /metrics 挂在服务根路径（不在 /v1 下）：用 origin 拼。
+ * baseUrl 解析失败时退回去尾斜杠拼接。
+ */
+export function metricsUrlFor(baseUrl: string): string {
+  try {
+    const u = new URL(baseUrl)
+    return `${u.protocol}//${u.host}/metrics`
+  } catch {
+    return `${baseUrl.replace(/\/+$/, '')}/metrics`
+  }
+}
+
 // ---- 核心：探测 + 单飞 + TTL ----
 
 export interface ProbeDeps {
@@ -224,10 +237,9 @@ async function probeOnce(
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), PROBE_FETCH_TIMEOUT_MS)
   try {
-    const resp = await deps.fetchImpl(
-      `${baseUrl.replace(/\/+$/, '')}/metrics`,
-      { signal: controller.signal },
-    )
+    const resp = await deps.fetchImpl(metricsUrlFor(baseUrl), {
+      signal: controller.signal,
+    })
     const now = deps.now()
     if (!resp.ok) {
       registerFailure(ep, now, `http ${resp.status}`)
@@ -353,6 +365,11 @@ export function trackForegroundInFlight(baseUrl: string, delta: 1 | -1): void {
 
 export function foregroundInFlightCount(baseUrl: string): number {
   return getEp(endpointKeyOf(baseUrl)).foregroundInFlight
+}
+
+/** 读端点差分采样（model.ts 的吞吐/抢占/命中率信号） */
+export function diffsForEndpoint(baseUrl: string): ThroughputDiffs {
+  return getEp(endpointKeyOf(baseUrl)).diffs
 }
 
 // ---- 测试/会话复位 ----

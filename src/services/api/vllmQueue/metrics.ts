@@ -8,7 +8,7 @@
  * - 直方图三件套 *_bucket{le}/_sum/_count 全解析；缺族置 null 不报错；
  * - 主链路永不因解析崩：任何单样本畸形只丢该样本。
  */
-import type { RawSample, VllmHistogram, VllmSnapshot } from './types.ts'
+import type { RawSample, VllmHistogram, VllmSnapshot } from './types.js'
 
 // ---------- Prometheus 文本解析 ----------
 
