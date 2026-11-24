@@ -92,3 +92,49 @@ bun test tests/smoke/vllm-queue-anthropic.test.ts     # anthropic 路径接线 4
 
 真实 vLLM 联调（4 变体：正常/disable-log-stats/旧指标名/鉴权反代）由几爹爹
 手动执行；fixture 样本从实测端点回存到本测试文件即可。
+
+---
+
+## 2026-11-25 修改备注（commit f1ecebbd，v2.2；实际时钟 11-24 23:40 – 11-25 00:0x）
+
+本次修改与上述原计划/本文旧表述的差异，正文已按 v2.2 同步，以下为差异清单与
+测试结果存档。正文「接线点」OpenAI 行残留的「响应头到达 dispose」为 v2.1 旧
+表述，以硬规则 7 为准。
+
+### 与原计划的差异
+
+1. **位次口径改 max，不再叠加**：v2.1 的 `Σ + aheadLocal` 会把同进程并发请求
+   双计（本地位次与 gauge 各算一遍）。v2.2 改为
+   `ahead = max(running + waiting − 1, aheadLocal)`——gauge 含我自己故减 1，
+   aheadLocal 仅作下界保底（快照过期/上游持留代理时服务端计数看不到我）。
+2. **ETA 能力整体下线**（原 P1 校准闭环随之取消）：删除预测/先验/融合/
+   blendWeight/etaBucket/showEta 设置键/ETA 跳变吞拍/queueAwareBackoffMs。
+   火力全部投入位次精确性。rankBucket 改精确优先：u0 准数、u1 约数、u2 才放粗
+   （位次源是 vLLM gauge 实时计数，本就精确，无需时间外推）。
+3. **dispose 触发点：响应头 → 首个 body 数据块（真机 bug 修复）**：实测 vLLM
+   在请求仍 waiting 时就回 200 + SSE 头（+0.15s），body 首块要等准入（排队
+   100s+ 的请求首块在 +103s）。旧接线「头到即 dispose」导致排队行刚出现就被
+   撕掉；先前联调能显示，是因为测试代理 hold 住了请求掩住了该行为。anthropic
+   路径 `client.ts attachQueueDisposeToBody`，openai 路径
+   `openai/index.ts gateStreamUntilFirstChunk`，均在首块/流终止/错误/取消时
+   dispose；`gate.dispose` 加幂等保护（多路径触发）。
+
+### 测试结果
+
+- 离线：vllm-queue 6 文件 **74 用例全绿**（新增 `vllm-queue-dispose-timing.test.ts`
+  11 用例），`tsc --noEmit` 0 错。2026-11-25 00:2x review 时复跑确认。
+- 真机（seetacloud qwen3827，262144 上下文，max-num-seqs=2，pass-through 代理
+  无 hold）：排队行稳定停留 **3m48s**，数字 9→8→7→6→5→4 逐拍与
+  `running + waiting − 1` 完全一致；准入后自动让位原始 spinner（✻ Cooked
+  for 3m 48s）。
+- 环境事实：seetacloud 按 SNI 路由，纯 TCP 隧道 404，需 HTTP→HTTPS 桥（保
+  Host/SNI）；该 vLLM 未开 `--enable-auto-tool-choice`，ccb 发 tools 会 400，
+  联调代理需剥 tools/tool_choice。脚本 `/tmp/vllm_bridge.py` +
+  `/tmp/queue_proxy.py`（HOLD_THRESHOLD=0 即透传）。
+
+### 快服务器（秒级完成请求）适配结论（2026-11-25 评审）
+
+局域网单 endpoint、无代理的生产形态下，位次精度与服务器速度无关（gauge 直读，
+非时间外推）。唯一残留是采样间隔内的队列移动滞后（1~2 个身位、单向、下拍收敛），
+建议此类端点配 `vllmQueueHints.pollMs: 500~800`；秒级完成的请求在首拍（2s）前
+即准入，排队行不出现——属设计语义（不闪烁），非漏报。
