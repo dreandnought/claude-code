@@ -403,7 +403,6 @@ export const SettingsSchema = lazySchema(() =>
         .object({
           pollMs: z.coerce.number().int().min(200).max(60_000).optional(),
           thresholdMs: z.coerce.number().int().min(0).max(120_000).optional(),
-          showEta: z.boolean().optional(),
           uncertaintyHints: z.boolean().optional(),
           calibration: z.boolean().optional(),
           maxLocalConcurrency: z.coerce

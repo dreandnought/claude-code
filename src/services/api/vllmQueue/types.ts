@@ -58,13 +58,12 @@ export interface VllmSnapshot {
   maxGenTokensHist: VllmHistogram | null
 }
 
-/** 排队状态事件（withRetry → REPL 渲染通道） */
+/** 排队状态事件（gate → statusStore → UI；v2.2 移除 ETA 字段） */
 export interface QueueStatus {
   endpoint: string
   querySource: string
   ahead: number
-  etaSec: number | null
-  /** 不确定性档位：0 低（报具体数）1 中（区间）2 高（放粗措辞） */
+  /** 不确定性档位：0 低（报准数）1 中（约数）2 高（放粗措辞） */
   uncertainty: 0 | 1 | 2
   /** 展示文案（estimate.ts 生成） */
   display: string

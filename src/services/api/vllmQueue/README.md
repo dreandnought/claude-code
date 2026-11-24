@@ -1,12 +1,14 @@
-# vllmQueue — 本地 vLLM 排队提示（ccb 侧，P0）
+# vllmQueue — 本地 vLLM 排队提示（ccb 侧，P0.6 / 方案 v2.2）
 
-方案文档：`ccb/方案-ccb-vllm排队提示-v2-20261116.md`（v2.1）。本目录是实现。
+方案文档：`ccb/方案-ccb-vllm排队提示-v2-20261116.md`（v2.1 框架）+ 本文 v2.2 修订。
 
 ## 一句话
 
-ccb 接入本机 vLLM（OpenAI 兼容端点）且请求被排队阻塞时，spinner 行显示
-「⏳ 排队中 · 前面约 N 个 · 预计 Xs」；位次为量级可信（非个位数精确），
-ETA 由直方图先验 + token 预算模型融合估算。只读公开 `/metrics`，零 vLLM 改动。
+ccb 接入本机 vLLM 且请求在服务端排队时，spinner 行显示
+「⏳ 排队中 · 前面 N 个」；请求准入后恢复原始动词动画（Ionizing…）。
+N 为精确位次：`running + waiting − 1`（服务端 gauge 含我自己）与本地
+FIFO 记账取 max。v2.2 起 ETA 能力整体下线，火力全部投入位次精确性。
+只读公开 `/metrics`，零 vLLM 改动。
 
 ## 开关
 
@@ -17,7 +19,6 @@ ETA 由直方图先验 + token 预算模型融合估算。只读公开 `/metrics
   "vllmQueueHints": {            // 仅 vllm 模式读取
     "pollMs": 1500,              // 前台在途时的 /metrics 轮询间隔
     "thresholdMs": 8000,         // 首 token 前多久开始判排队
-    "showEta": true,
     "uncertaintyHints": true,    // 措辞随不确定性放粗
     "calibration": true,         // P1 自观测校准（P0 预留）
     "maxLocalConcurrency": 0     // P1 本地限流（P0 预留）
@@ -35,7 +36,7 @@ OpenAI 兼容 baseUrl；公共 API（含反代公网域名）零触碰。
 | 文件 | 职责 | IO |
 |---|---|---|
 | `metrics.ts` | Prometheus 文本 + histogram 三件套解析、分位数插值、代际名字容错 | 纯函数 |
-| `model.ts` | 位次/ETA 融合估算 + 特殊态（队满/deferred/KV满载） | 纯函数 |
+| `model.ts` | 精确位次（gauge-1 vs 本地记账取 max）+ 特殊态（队满/deferred/KV满载） | 纯函数 |
 | `estimate.ts` | 不确定性感知分档文案、退避时长建议 | 纯函数 |
 | `visibility.ts` | querySource 前后台分类表（表外默认后台+warning） | 纯函数 |
 | `ledger.ts` | 本进程 FIFO 位次记账 | 进程内 |
@@ -59,15 +60,24 @@ OpenAI 兼容 baseUrl；公共 API（含反代公网域名）零触碰。
    后台（title/hook/classifier…）零提示零轮询。钉：model.test.ts。
 3. 我在跑且 waiting=0 → 显示「推理中」语义（不弹排队行），防长思考误报。
 4. 解析永不抛：畸形/空/垃圾 /metrics 响应只降级，绝不打断主请求链路。
-5. 单调性：同请求内 ETA 跳升 >1.6× 吞一拍（远端快照抖动）。
+5. 单调性：同请求内「前面 N 个」跳升 >1.6× 且 <+2 以上吞一拍（快照抖动）。
+6. 位次口径 v2.2：`ahead = max(running + waiting − 1, aheadLocal)`。
+   减 1 因 gate 在请求发出后启动，本机 vLLM 毫秒级准入后 gauge 已含我；
+   aheadLocal 只作下界不再叠加（v2.1 的 Σ+aheadLocal 会双计同进程请求）。
+   钉：model.test.ts 前三条用例。
+7. **dispose 触发点 = 首个 body 数据块，而非响应头。** vLLM 在请求仍
+   waiting 时就回 200 + SSE 头（实测 +0.15s），body 首块要等准入（排队
+   100s+ 的请求首块在 +103s）。旧「头到即 dispose」会把排队行刚出现就撕掉。
+   anthropic 路径：`client.ts attachQueueDisposeToBody`；openai 路径：
+   `openai/index.ts gateStreamUntilFirstChunk`。钉：
+   `tests/smoke/vllm-queue-dispose-timing.test.ts`（11 用例）。
 
 ## P1 待办（本目录设计已留口）
 
-- `calibrate.ts`：自观测样本（等待实际时长/预测比）→ 校准系数 k、本地
-  queue-time 分布融合；持久化 `~/.claude/vllm-queue-calibration.json`
+- `calibrate.ts`：自观测样本（位次变化实际序列）→ 位次可信度回归；持久化
+  `~/.claude/vllm-queue-calibration.json`
 - 跨进程票据 `~/.claude/vllm-queue-<hash>.json`（仿 computerUseLock 模式）
 - subagent 活动行（AgentProgressLine）各自显示 own aheadLocal
-- ETA 指导退避（withRetry 的 429/503 分支接 `queueAwareBackoffMs`）
 - `-p` 模式 stderr 进度行
 
 ## 测试

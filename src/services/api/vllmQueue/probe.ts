@@ -108,7 +108,6 @@ export function getQueueDisplayMode(): QueueDisplayMode {
 export function getVllmQueueHints(): {
   pollMs: number
   thresholdMs: number
-  showEta: boolean
   uncertaintyHints: boolean
   calibration: boolean
   maxLocalConcurrency: number
@@ -119,7 +118,6 @@ export function getVllmQueueHints(): {
   return {
     pollMs: numberOr(h.pollMs, PROBE_DEFAULT_POLL_MS),
     thresholdMs: numberOr(h.thresholdMs, 8000),
-    showEta: h.showEta !== false,
     uncertaintyHints: h.uncertaintyHints !== false,
     calibration: h.calibration !== false,
     maxLocalConcurrency: numberOr(h.maxLocalConcurrency, 0),

@@ -22,7 +22,7 @@ import {
 import { isForegroundQuerySource } from './visibility.js'
 import { aheadLocalFor, complete, enqueue } from './ledger.js'
 import { estimateQueue, type ModelEstimate } from './model.js'
-import { renderQueueLine, suggestedBackoffMs } from './estimate.js'
+import { renderQueueLine } from './estimate.js'
 import { clearQueueStatus, publishQueueStatus } from './statusStore.js'
 
 export interface GateDeps {
@@ -33,8 +33,6 @@ export interface GateDeps {
 export interface GateOptions {
   baseUrl: string
   querySource?: QuerySource
-  /** 本次请求 prompt token 估算（0=未知） */
-  promptTokensEst?: number
   /** 展示后缀，如 subagent 名称 */
   suffix?: string
   /** 测试注入；默认 globalThis.fetch + Date.now */
@@ -82,7 +80,7 @@ export function withQueueHints(opts: GateOptions): QueueHandle {
 
   let stopped = false
   let timer: ReturnType<typeof setTimeout> | null = null
-  let lastEta: number | null = null
+  let lastAhead: number | null = null
 
   const publishTick = async (): Promise<void> => {
     if (stopped) return
@@ -93,25 +91,19 @@ export function withQueueHints(opts: GateOptions): QueueHandle {
           snapshot: snap,
           diffs: diffsForEndpoint(opts.baseUrl),
           aheadLocal: aheadLocalFor(ticket),
-          selfPromptTokens: opts.promptTokensEst ?? 0,
-          calibrationK: 1,
-          localSampleCount: 0,
           snapshotAgeMs: Math.max(0, deps.now() - snap.fetchedAt),
         })
-        if (acceptable(est, lastEta)) {
-          const rendered = renderQueueLine(est, {
-            showEta: hints.showEta,
-            uncertaintyHints: hints.uncertaintyHints,
-            suffix: opts.suffix,
+        const rendered = renderQueueLine(est, {
+          uncertaintyHints: hints.uncertaintyHints,
+          suffix: opts.suffix,
+        })
+        if (rendered.show && acceptable(est, lastAhead)) {
+          publishQueueStatus({
+            line: rendered.text,
+            key,
+            publishedAt: deps.now(),
           })
-          if (rendered.show) {
-            publishQueueStatus({
-              line: rendered.text,
-              key,
-              publishedAt: deps.now(),
-            })
-            if (est.etaSec !== null) lastEta = est.etaSec
-          }
+          lastAhead = est.ahead
         }
       }
     } catch (err) {
@@ -130,6 +122,7 @@ export function withQueueHints(opts: GateOptions): QueueHandle {
 
   return {
     dispose: () => {
+      if (stopped) return // 幂等：头/首块/错误多路径都可能触发
       stopped = true
       if (timer !== null) clearTimeout(timer)
       trackForegroundInFlight(opts.baseUrl, -1)
@@ -139,10 +132,10 @@ export function withQueueHints(opts: GateOptions): QueueHandle {
   }
 }
 
-/** 单调性：ETA 相对上次跳升 >1.6× 视为远端快照抖动，吞一拍（§3 防闪烁） */
-function acceptable(est: ModelEstimate, lastEta: number | null): boolean {
-  if (lastEta === null || est.etaSec === null) return true
-  return est.etaSec <= lastEta * 1.6
+/** 位次单调性：同一请求内「前面 N 个」跳升 >1.6× 视为快照抖动，吞一拍防闪烁 */
+function acceptable(est: ModelEstimate, lastAhead: number | null): boolean {
+  if (lastAhead === null) return true
+  return est.ahead <= Math.max(lastAhead * 1.6, lastAhead + 2)
 }
 
 function ownerKindOf(
@@ -153,12 +146,4 @@ function ownerKindOf(
   if (qs === 'compact') return 'compact'
   if (qs.startsWith('agent:') || qs.startsWith('hook_')) return 'subagent'
   return 'unknown'
-}
-
-/** 429/503 命中 vLLM 端点时给退避时长建议（withRetry 路径复用） */
-export function queueAwareBackoffMs(
-  etaSec: number | null,
-  fallbackMs: number,
-): number {
-  return suggestedBackoffMs(etaSec, fallbackMs)
 }

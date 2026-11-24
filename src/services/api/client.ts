@@ -387,7 +387,7 @@ function buildFetch(
       // never let logging crash the fetch
     }
     // vLLM 排队提示（anthropic 路径，与 openai 路径同款包装）：请求发出前
-    // 启动 gate 观察，响应头到达=服务端已受理（排队结束）立即 dispose。
+    // 启动 gate 观察，请求真正开始产出（首个 body 数据块）时 dispose。
     // 非本机 ANTHROPIC_BASE_URL / queueDisplay=off / 后台请求在 gate 入口
     // 短路，这里零开销。官方 api.anthropic.com 永远非 RFC1918，零触碰。
     let queueHandle: QueueHandle | null = null
@@ -410,9 +410,69 @@ function buildFetch(
     const result = inner(input, { ...init, headers })
     if (queueHandle) {
       const h = queueHandle
-      // 响应头到达即销卡；流式 body 读取不影响（排队在头之前已结束）。
-      void Promise.resolve(result).finally(() => h.dispose())
+      // 响应头≠受理。实测 vLLM（Anthropic 端点）在请求仍在 waiting 时就先回
+      // 200 + SSE 头（+0.15s），body 首块要等准入后才到（排队 100s+ 的请求
+      // 首块在 +103s）。若在头到达就 dispose，排队行刚出现就被撕掉。
+      // 以首个 body 数据块或流终止/错误为真正终点。
+      void Promise.resolve(result)
+        .then(res => {
+          attachQueueDisposeToBody(res, h.dispose)
+          return res
+        })
+        .catch(() => h.dispose())
     }
     return result
+  }
+}
+
+/**
+ * 把 gate 的 dispose 挂到响应 body 的首个数据块（或流终止/被取消）上。
+ * 不改动 Response 的其他字段，只替换 body 为包了一层的流。
+ * 任何异常都退化为立即 dispose，绝不影响主请求。
+ */
+export function attachQueueDisposeToBody(
+  res: Response,
+  dispose: () => void,
+): void {
+  try {
+    const body = res?.body
+    if (!body || typeof body.getReader !== 'function') {
+      dispose()
+      return
+    }
+    let done = false
+    const finish = (): void => {
+      if (done) return
+      done = true
+      dispose()
+    }
+    const reader = body.getReader()
+    const wrapped = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const { done: streamDone, value } = await reader.read()
+          if (streamDone) {
+            finish()
+            controller.close()
+            return
+          }
+          finish() // 首个数据块 = 已开始产出（排队结束）
+          controller.enqueue(value)
+        } catch (err) {
+          finish()
+          controller.error(err)
+        }
+      },
+      cancel(reason) {
+        finish()
+        return reader.cancel(reason)
+      },
+    })
+    Object.defineProperty(res, 'body', {
+      value: wrapped,
+      configurable: true,
+    })
+  } catch {
+    dispose()
   }
 }

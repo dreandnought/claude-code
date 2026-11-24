@@ -103,7 +103,6 @@ describe('settings schema: queue display keys', () => {
       vllmQueueHints: {
         pollMs: 1500,
         thresholdMs: 8000,
-        showEta: true,
         uncertaintyHints: true,
         calibration: false,
         maxLocalConcurrency: 4,
@@ -119,8 +118,9 @@ describe('settings schema: queue display keys', () => {
         .success,
     ).toBe(false)
     expect(
-      SettingsSchema().safeParse({ vllmQueueHints: { showEta: 'yes' } })
-        .success,
+      SettingsSchema().safeParse({
+        vllmQueueHints: { uncertaintyHints: 'yes' },
+      }).success,
     ).toBe(false)
   })
 })

@@ -1,9 +1,9 @@
 /**
- * 基础能力冒烟测试：vllmQueue 估算与显示层（方案 v2.1 批次3）
+ * 基础能力冒烟测试：vllmQueue 估算与显示层（方案 v2.2 位次精确化）
  *
  * 覆盖：
- * 1. model.ts 融合估算：位次合成、先验/预测权重、特殊态（队满/deferred/KV满载）
- * 2. estimate.ts 分档：不确定性放粗、ETA 分档、"推理中不显示排队行"防误报
+ * 1. model.ts 位次估算：-1 口径、aheadLocal 下界取 max、特殊态（队满/deferred/KV满载）
+ * 2. estimate.ts 分档：u0 准数/u1 约数/u2 放粗、「推理中不显示排队行」防误报
  * 3. visibility.ts 前后台分类表：表外默认后台+warning、undefined 归前台
  * 4. ledger.ts FIFO 位次：入队/销账/同端点隔离
  * 5. gate.ts 编排：off 零执行、公共端点零执行、首拍发布→dispose 清行
@@ -15,12 +15,10 @@ import {
   type ProbeFetch,
 } from '../../src/services/api/vllmQueue/probe'
 import {
-  blendWeight,
   estimateQueue,
   type ModelInputs,
 } from '../../src/services/api/vllmQueue/model'
 import {
-  etaBucket,
   rankBucket,
   renderQueueLine,
 } from '../../src/services/api/vllmQueue/estimate'
@@ -91,9 +89,6 @@ function inputs(partial: Partial<ModelInputs> = {}): ModelInputs {
       prefixHitRate: null,
     },
     aheadLocal: 0,
-    selfPromptTokens: 0,
-    calibrationK: 1,
-    localSampleCount: 0,
     snapshotAgeMs: 0,
     ...partial,
   }
@@ -102,32 +97,36 @@ function inputs(partial: Partial<ModelInputs> = {}): ModelInputs {
 // ---------- 1. model.ts ----------
 
 describe('vllmQueue model estimate', () => {
-  test('ahead = running + waiting + aheadLocal', () => {
+  test('ahead = running + waiting - 1（含自己减一）', () => {
     const est = estimateQueue(
       inputs({
-        snapshot: snap({ running: 3, waiting: 7 }),
-        aheadLocal: 2,
+        snapshot: snap({ running: 2, waiting: 3 }),
       }),
     )
-    expect(est.ahead).toBe(12)
+    // 2+3-1=4：running 里那条就是我
+    expect(est.ahead).toBe(4)
     expect(est.kind).toBe('queued')
   })
 
-  test('queue-time histogram prior drives ETA when model leg is cold', () => {
-    const hist = parseVllmMetrics(
-      `vllm:num_requests_waiting 4
-vllm:request_queue_time_seconds_bucket{le="30"} 10
-vllm:request_queue_time_seconds_bucket{le="60"} 30
-vllm:request_queue_time_seconds_bucket{le="+Inf"} 40
-vllm:request_queue_time_seconds_sum 1600
-vllm:request_queue_time_seconds_count 40
-`,
-      1_000_000,
+  test('aheadLocal is a floor (max), never additive on top of server count', () => {
+    const est = estimateQueue(
+      inputs({
+        snapshot: snap({ running: 1, waiting: 0 }),
+        aheadLocal: 2,
+      }),
     )
-    const est = estimateQueue(inputs({ snapshot: hist, aheadLocal: 0 }))
-    expect(est.etaSec).not.toBeNull()
-    expect(est.etaSec!).toBeGreaterThan(0)
-    expect(est.etaSec!).toBeLessThan(300)
+    // 服务端看到 0（只有我自己），本地记账 2 个更早未完成 → 取下界 2
+    expect(est.ahead).toBe(2)
+  })
+
+  test('stale server count never double-counts aheadLocal', () => {
+    const est = estimateQueue(
+      inputs({
+        snapshot: snap({ running: 3, waiting: 7 }),
+        aheadLocal: 2, // 这 2 条已经在 server 的 waiting 里
+      }),
+    )
+    expect(est.ahead).toBe(9) // max(9, 2)，不是 v2.1 的 12
   })
 
   test('endpoint_full kind from admission rejections with empty queue', () => {
@@ -144,7 +143,7 @@ vllm:request_queue_time_seconds_count 40
       }),
     )
     expect(est.kind).toBe('endpoint_full')
-    expect(est.etaSec).toBeNull()
+    expect(est.ahead).toBe(0)
   })
 
   test('deferred backlog when >50% waiting deferred', () => {
@@ -174,26 +173,24 @@ vllm:request_queue_time_seconds_count 40
     expect(est.selfLikelyRunning).toBe(true)
   })
 
-  test('blend weight climbs 0.3→0.7 with local samples', () => {
-    expect(blendWeight(0)).toBeCloseTo(0.3)
-    expect(blendWeight(10)).toBeCloseTo(0.5)
-    expect(blendWeight(20)).toBeCloseTo(0.7)
-    expect(blendWeight(100)).toBeCloseTo(0.7)
-  })
-
-  test('no data anywhere → conservative cold estimate, uncertainty raised', () => {
+  test('pure gauge count needs no history: ahead exact even cold', () => {
     const est = estimateQueue(inputs({ snapshot: snap({ waiting: 9 }) }))
-    expect(est.ahead).toBe(9)
-    expect(est.uncertainty).toBeGreaterThanOrEqual(1)
-    // 保守预测仍给得出（30s 冷经验值），直方图缺失计入不确定性
-    expect(est.etaSec).not.toBeNull()
+    expect(est.ahead).toBe(8)
+    expect(est.uncertainty).toBe(0) // 位次来自 gauge，与直方图有无无关
   })
 
-  test('stale snapshot and multi-engine raise uncertainty to 2', () => {
+  test('stale snapshot + multi-engine + preemption raise uncertainty to 2', () => {
     const est = estimateQueue(
       inputs({
         snapshot: snap({ waiting: 3, engineCount: 4 }),
         snapshotAgeMs: 60_000,
+        diffs: {
+          prefillTokPerSecEma: null,
+          decodeTokPerSecEma: null,
+          preemptionDelta: 2,
+          admissionRejectionDelta: 0,
+          prefixHitRate: null,
+        },
       }),
     )
     expect(est.uncertainty).toBe(2)
@@ -203,52 +200,76 @@ vllm:request_queue_time_seconds_count 40
 // ---------- 2. estimate.ts 分档 ----------
 
 describe('vllmQueue display buckets', () => {
-  test('rank buckets per spec: 1 / N / round5 / 20+ / 50+', () => {
+  test('u=0 reports the exact count (gauge source is precise)', () => {
     expect(rankBucket(1, 0)).toBe('前面 1 个')
     expect(rankBucket(3, 0)).toBe('前面 3 个')
-    expect(rankBucket(8, 0)).toBe('前面约 10 个')
-    expect(rankBucket(30, 0)).toBe('前面 20+ 个')
-    expect(rankBucket(60, 0)).toBe('排队较多（50+）')
+    expect(rankBucket(8, 0)).toBe('前面 8 个')
+    expect(rankBucket(47, 0)).toBe('前面 47 个')
   })
 
-  test('uncertainty coarsens one tier per level', () => {
-    expect(rankBucket(8, 1)).toBe('前面 20+ 个') // round5→twenty
-    expect(rankBucket(3, 2)).toBe('前面 20+ 个') // few→round5→twenty
+  test('u=1 keeps the number, marks it approximate (round5 above 10)', () => {
+    expect(rankBucket(3, 1)).toBe('前面约 3 个')
+    expect(rankBucket(8, 1)).toBe('前面约 8 个')
+    expect(rankBucket(12, 1)).toBe('前面约 15 个')
   })
 
-  test('eta buckets: <30s / ~1min / N min / >10min', () => {
-    expect(etaBucket(12)).toBe('预计 12s')
-    expect(etaBucket(40)).toBe('预计 ~1min')
-    expect(etaBucket(180)).toBe('预计 3min')
-    expect(etaBucket(900)).toBe('预计 >10min')
+  test('u=2 drops to verbal bands', () => {
+    expect(rankBucket(2, 2)).toBe('前面没几个')
+    expect(rankBucket(8, 2)).toBe('前面 8 个上下')
+    expect(rankBucket(15, 2)).toBe('前面十几个起')
+  })
+
+  test('normal queued line: 排队中 + rank, no ETA text', () => {
+    const r = renderQueueLine(
+      {
+        ahead: 4,
+        uncertainty: 0,
+        kind: 'queued',
+        selfLikelyRunning: false,
+      },
+      { uncertaintyHints: true },
+    )
+    expect(r.show).toBe(true)
+    expect(r.text).toBe('⏳ 排队中 · 前面 4 个')
   })
 
   test('u=2 renders coarse line without concrete rank', () => {
     const r = renderQueueLine(
       {
-        ahead: 12,
-        etaSec: 90,
+        ahead: 60,
         uncertainty: 2,
         kind: 'queued',
         selfLikelyRunning: false,
       },
-      { showEta: true, uncertaintyHints: true },
+      { uncertaintyHints: true },
     )
     expect(r.show).toBe(true)
-    expect(r.text).toContain('队列较长')
-    expect(r.text).not.toContain('12')
+    expect(r.text).toContain('前面十几个起')
+    expect(r.text).not.toContain('60')
+  })
+
+  test('uncertaintyHints=false pins exact count', () => {
+    const r = renderQueueLine(
+      {
+        ahead: 60,
+        uncertainty: 2,
+        kind: 'queued',
+        selfLikelyRunning: false,
+      },
+      { uncertaintyHints: false },
+    )
+    expect(r.text).toBe('⏳ 排队中 · 前面 60 个')
   })
 
   test('inference-not-queue case suppresses the line (防长思考误报)', () => {
     const r = renderQueueLine(
       {
         ahead: 1,
-        etaSec: null,
         uncertainty: 0,
         kind: 'queued',
         selfLikelyRunning: true,
       },
-      { showEta: true, uncertaintyHints: true },
+      { uncertaintyHints: true },
     )
     expect(r.show).toBe(false)
   })
@@ -257,12 +278,11 @@ describe('vllmQueue display buckets', () => {
     const r = renderQueueLine(
       {
         ahead: 0,
-        etaSec: null,
         uncertainty: 1,
         kind: 'endpoint_full',
         selfLikelyRunning: false,
       },
-      { showEta: true, uncertaintyHints: true },
+      { uncertaintyHints: true },
     )
     expect(r.text).toContain('端点队列已满')
   })

@@ -432,9 +432,10 @@ export async function* queryModelOpenAI(
     // 11. Call OpenAI API with streaming. ChatGPT subscription auth uses the
     // Codex Responses backend; API-key/OpenAI-compatible auth keeps the
     // existing Chat Completions adapter.
-    // vLLM 排队提示（方案 v2.1 批次3）：请求发出前启动 gate 观察；响应头
-    // 到达=服务端已受理（排队结束），立即 dispose 撕行。off/非本机/后台请求
-    // 在 withQueueHints 入口即短路，这里零开销。队列期恰在 fetch 挂起窗口内。
+    // vLLM 排队提示（方案 v2.1 批次3）：请求发出前启动 gate 观察；
+    // 响应头到达≠受理（vLLM 排队时先回头再排 body），收到首个流数据块
+    // （或流终止/错误）才 dispose 撕行。off/非本机/后台请求在 withQueueHints
+    // 入口即短路，这里零开销。
     const queueBaseUrl =
       process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
     const queueHandle = withQueueHints({
@@ -443,40 +444,52 @@ export async function* queryModelOpenAI(
     })
     const adaptedStream = useChatGPTResponses
       ? adaptResponsesStreamToAnthropic(
-          await createChatGPTResponsesStream({
-            request: buildResponsesRequest({
-              model: openaiModel,
-              messages: openaiMessages,
-              tools: openaiTools,
-              toolChoice: openaiToolChoice,
-              reasoningEffort,
-              promptCacheKey: sessionPromptCacheKey,
-            }),
-            signal,
-            fetchOverride: options.fetchOverride as unknown as typeof fetch,
-          }).finally(() => queueHandle.dispose()),
-          openaiModel,
-        )
-      : adaptOpenAIStreamToAnthropic(
-          await getOpenAIClient({
-            maxRetries: 0,
-            fetchOverride: options.fetchOverride as unknown as typeof fetch,
-            source: options.querySource,
-          })
-            .chat.completions.create(
-              buildOpenAIRequestBody({
+          gateStreamUntilFirstChunk(
+            await createChatGPTResponsesStream({
+              request: buildResponsesRequest({
                 model: openaiModel,
                 messages: openaiMessages,
                 tools: openaiTools,
                 toolChoice: openaiToolChoice,
-                enableThinking: effectiveThinking,
-                maxTokens,
-                temperatureOverride: options.temperatureOverride,
-                promptCacheKey,
+                reasoningEffort,
+                promptCacheKey: sessionPromptCacheKey,
               }),
-              { signal },
-            )
-            .finally(() => queueHandle.dispose()),
+              signal,
+              fetchOverride: options.fetchOverride as unknown as typeof fetch,
+            }).catch(err => {
+              queueHandle.dispose()
+              throw err
+            }),
+            queueHandle.dispose,
+          ),
+          openaiModel,
+        )
+      : adaptOpenAIStreamToAnthropic(
+          gateStreamUntilFirstChunk(
+            await getOpenAIClient({
+              maxRetries: 0,
+              fetchOverride: options.fetchOverride as unknown as typeof fetch,
+              source: options.querySource,
+            })
+              .chat.completions.create(
+                buildOpenAIRequestBody({
+                  model: openaiModel,
+                  messages: openaiMessages,
+                  tools: openaiTools,
+                  toolChoice: openaiToolChoice,
+                  enableThinking: effectiveThinking,
+                  maxTokens,
+                  temperatureOverride: options.temperatureOverride,
+                  promptCacheKey,
+                }),
+                { signal },
+              )
+              .catch(err => {
+                queueHandle.dispose()
+                throw err
+              }),
+            queueHandle.dispose,
+          ),
           openaiModel,
           { includeCacheWriteTokens: useOfficialOpenAICache },
         )
@@ -653,4 +666,58 @@ export async function* queryModelOpenAI(
         : new Error(String(error))) as unknown as SDKAssistantMessageError,
     })
   }
+}
+
+/**
+ * 让排队 gate 活到「流真正开始产出」而不是「响应头到达」。
+ *
+ * vLLM 在请求仍排队（waiting）时就回 200 + 响应头，body 要等准入后才开始；
+ * 若在头到达就 dispose，排队行刚出现就被撕掉。这里包一层 async iterable：
+ * 首个 item / 流终止 / 抛错时才 dispose。Proxy 只为拦截 Symbol.asyncIterator，
+ * 其余属性与方法透传（函数绑定回原对象，避免破坏 SDK 的私有字段）。
+ */
+export function gateStreamUntilFirstChunk<T extends AsyncIterable<unknown>>(
+  stream: T,
+  dispose: () => void,
+): T {
+  let finished = false
+  const finish = (): void => {
+    if (finished) return
+    finished = true
+    dispose()
+  }
+  return new Proxy(stream, {
+    get(target, prop, receiver) {
+      if (prop === Symbol.asyncIterator) {
+        return () => {
+          const inner = (target as AsyncIterable<unknown>)[
+            Symbol.asyncIterator
+          ]()
+          return {
+            async next() {
+              try {
+                const r = await inner.next()
+                finish()
+                return r
+              } catch (err) {
+                finish()
+                throw err
+              }
+            },
+            async return(value?: unknown) {
+              finish()
+              return inner.return ? inner.return(value) : { done: true, value }
+            },
+            async throw(err?: unknown) {
+              finish()
+              if (inner.throw) return inner.throw(err)
+              throw err
+            },
+          }
+        }
+      }
+      const value = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  }) as T
 }
