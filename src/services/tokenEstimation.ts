@@ -22,6 +22,7 @@ import {
   normalizeModelStringForAPI,
 } from '../utils/model/model.js'
 import { jsonStringify } from '../utils/slowOperations.js'
+import { estimateTokensForText } from '../utils/tokenRatio.js'
 import { isToolReferenceBlock } from '../utils/searchExtraTools.js'
 import { getAPIMetadata, getExtraBodyParams } from './api/claude.js'
 import { getAnthropicClient } from './api/client.js'
@@ -216,7 +217,9 @@ export function roughTokenCountEstimation(
   content: string,
   bytesPerToken: number = 4,
 ): number {
-  return Math.round(content.length / bytesPerToken)
+  // CJK-aware: ideographs/kanji/hangul count ~1 token per character instead of
+  // being divided by the English ratio. Non-CJK text keeps `bytesPerToken`.
+  return estimateTokensForText(content, bytesPerToken)
 }
 
 /**

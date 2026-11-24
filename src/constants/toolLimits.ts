@@ -49,6 +49,15 @@ export const MAX_TOOL_RESULT_BYTES = MAX_TOOL_RESULT_TOKENS * BYTES_PER_TOKEN
 export const MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000
 
 /**
+ * The per-message aggregate budget expressed in tokens — the unit the enforcer
+ * actually compares against. 50k tokens is the same allowance as the legacy
+ * 200k-character constant for English prose, but counts CJK at ~1 token per
+ * character so a Chinese tool result cannot slip a whole window's worth of
+ * context past the budget.
+ */
+export const MAX_TOOL_RESULTS_PER_MESSAGE_TOKENS = 50_000
+
+/**
  * Maximum character length for tool summary strings in compact views.
  * Used by getToolUseSummary() implementations to truncate long inputs
  * for display in grouped agent rendering.

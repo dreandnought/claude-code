@@ -10,9 +10,10 @@ import {
   BYTES_PER_TOKEN,
   DEFAULT_MAX_RESULT_SIZE_CHARS,
   MAX_TOOL_RESULT_BYTES,
-  MAX_TOOL_RESULTS_PER_MESSAGE_CHARS,
+  MAX_TOOL_RESULTS_PER_MESSAGE_TOKENS,
 } from '../constants/toolLimits.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
+import { estimateTokensForText } from './tokenRatio.js'
 import { logEvent } from '../services/analytics/index.js'
 import { sanitizeToolNameForAnalytics } from '../services/analytics/metadata.js'
 import type { Message } from '../types/message.js'
@@ -418,7 +419,7 @@ export function cloneContentReplacementState(
  * check: GrowthBook's cache returns `cached !== undefined ? cached : default`,
  * so a flag served as null/string/NaN leaks through.
  */
-export function getPerMessageBudgetLimit(): number {
+export function getPerMessageBudgetLimitTokens(): number {
   const override = getFeatureValue_CACHED_MAY_BE_STALE<number | null>(
     'tengu_hawthorn_window',
     null,
@@ -428,9 +429,11 @@ export function getPerMessageBudgetLimit(): number {
     Number.isFinite(override) &&
     override > 0
   ) {
-    return override
+    // The flag has always been tuned in characters. Convert so existing tuning
+    // keeps its English-text behavior under the token-based budget.
+    return Math.max(1, Math.round(override / 4))
   }
-  return MAX_TOOL_RESULTS_PER_MESSAGE_CHARS
+  return MAX_TOOL_RESULTS_PER_MESSAGE_TOKENS
 }
 
 /**
@@ -486,7 +489,10 @@ export type ToolResultReplacementRecord = Extract<
 type ToolResultCandidate = {
   toolUseId: string
   content: NonNullable<ToolResultBlockParam['content']>
+  /** Characters — used for logging/formatting only. */
   size: number
+  /** Estimated tokens — the unit the per-message budget compares against. */
+  tokens: number
 }
 
 type CandidatePartition = {
@@ -529,6 +535,22 @@ function contentSize(
 }
 
 /**
+ * Token estimate for a tool result. CJK counts ~1 token/char, so a 200k-char
+ * Chinese result is budgeted at ~200k tokens instead of the ~50k a plain
+ * length/4 would report.
+ */
+function contentTokens(
+  content: NonNullable<ToolResultBlockParam['content']>,
+): number {
+  if (typeof content === 'string') return estimateTokensForText(content)
+  let tokens = 0
+  for (const b of content) {
+    if (b.type === 'text') tokens += estimateTokensForText(b.text)
+  }
+  return tokens
+}
+
+/**
  * Walk messages and build tool_use_id → tool_name from assistant tool_use
  * blocks. tool_use always precedes its tool_result (model calls, then result
  * arrives), so by the time budget enforcement sees a result, its name is known.
@@ -567,6 +589,7 @@ function collectCandidatesFromMessage(message: Message): ToolResultCandidate[] {
         toolUseId: block.tool_use_id,
         content: block.content,
         size: contentSize(block.content),
+        tokens: contentTokens(block.content),
       },
     ]
   })
@@ -674,19 +697,19 @@ function partitionByPriorDecision(
  */
 function selectFreshToReplace(
   fresh: ToolResultCandidate[],
-  frozenSize: number,
-  limit: number,
+  frozenTokens: number,
+  limitTokens: number,
 ): ToolResultCandidate[] {
-  const sorted = [...fresh].sort((a, b) => b.size - a.size)
+  const sorted = [...fresh].sort((a, b) => b.tokens - a.tokens)
   const selected: ToolResultCandidate[] = []
-  let remaining = frozenSize + fresh.reduce((sum, c) => sum + c.size, 0)
+  let remaining = frozenTokens + fresh.reduce((sum, c) => sum + c.tokens, 0)
   for (const c of sorted) {
-    if (remaining <= limit) break
+    if (remaining <= limitTokens) break
     selected.push(c)
     // We don't know the replacement size until after persist, but previews
     // are ~2K and results hitting this path are much larger, so subtracting
     // the full size is a close approximation for selection purposes.
-    remaining -= c.size
+    remaining -= c.tokens
   }
   return selected
 }
@@ -783,7 +806,7 @@ export async function enforceToolResultBudget(
   // Resolve once per call. A mid-session flag change only affects FRESH
   // messages (prior decisions are frozen via seenIds/replacements), so
   // prompt cache for already-seen content is preserved regardless.
-  const limit = getPerMessageBudgetLimit()
+  const limit = getPerMessageBudgetLimitTokens()
 
   // Walk each API-level message group independently. For previously-processed messages
   // (all IDs in seenIds) this just re-applies cached replacements. For the
@@ -823,8 +846,8 @@ export async function enforceToolResultBudget(
     skipped.forEach(c => state.seenIds.add(c.toolUseId))
     const eligible = fresh.filter(c => !shouldSkip(c.toolUseId))
 
-    const frozenSize = frozen.reduce((sum, c) => sum + c.size, 0)
-    const freshSize = eligible.reduce((sum, c) => sum + c.size, 0)
+    const frozenSize = frozen.reduce((sum, c) => sum + c.tokens, 0)
+    const freshSize = eligible.reduce((sum, c) => sum + c.tokens, 0)
 
     const selected =
       frozenSize + freshSize > limit

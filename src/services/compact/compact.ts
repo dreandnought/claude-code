@@ -42,7 +42,10 @@ import {
   type Attachment,
 } from '../../utils/attachments.js'
 import { getMemoryPath } from '../../utils/config.js'
-import { COMPACT_MAX_OUTPUT_TOKENS } from '../../utils/context.js'
+import {
+  COMPACT_MAX_OUTPUT_TOKENS,
+  getContextWindowForModel,
+} from '../../utils/context.js'
 import {
   analyzeContext,
   tokenStatsToStatsigMetrics,
@@ -298,9 +301,105 @@ export function truncateHeadForPTLRetry(
 
 export const ERROR_MESSAGE_PROMPT_TOO_LONG =
   'Conversation too long to summarize. Try /compact to manually clear conversation history, or start a new session with /clear.'
+
+/**
+ * Did the summarizer stop because it ran out of output budget? A truncated
+ * summary is not an error message, so the PTL retry loop never sees it — it
+ * would be accepted as the conversation's summary and silently lose most of
+ * the history.
+ */
+export function isTruncatedSummaryResponse(msg: AssistantMessage): boolean {
+  const stopReason = (msg.message as { stop_reason?: unknown } | undefined)
+    ?.stop_reason
+  return (
+    stopReason === 'max_tokens' ||
+    stopReason === 'model_context_window_exceeded'
+  )
+}
+
+/**
+ * Drop the oldest API-round groups until the message set fits `budgetTokens`.
+ *
+ * Used when the summarizer's output got cut: the input has to shrink so the
+ * summary itself has room. Returns the input array unchanged when it already
+ * fits, and null when nothing can be dropped without leaving an empty
+ * summarize set.
+ */
+export function truncateHeadToTokenBudget(
+  messages: Message[],
+  budgetTokens: number,
+): Message[] | null {
+  const input =
+    messages[0]?.type === 'user' &&
+    messages[0]?.isMeta &&
+    messages[0]?.message?.content === PTL_RETRY_MARKER
+      ? messages.slice(1)
+      : messages
+
+  const groups = groupMessagesByApiRound(input)
+  if (groups.length < 2) return null
+
+  const groupTokens = groups.map(g =>
+    roughTokenCountEstimationForMessages(
+      g as Parameters<typeof roughTokenCountEstimationForMessages>[0],
+    ),
+  )
+  const total = groupTokens.reduce((sum, t) => sum + t, 0)
+  if (total <= budgetTokens) return messages
+
+  const excess = total - budgetTokens
+  let acc = 0
+  let dropCount = 0
+  for (const tokens of groupTokens) {
+    acc += tokens
+    dropCount++
+    if (acc >= excess) break
+  }
+
+  // Keep at least one group so there's something to summarize.
+  dropCount = Math.min(dropCount, groups.length - 1)
+  if (dropCount < 1) return null
+
+  const sliced = groups.slice(dropCount).flat()
+  if (sliced[0]?.type === 'assistant') {
+    return [
+      createUserMessage({ content: PTL_RETRY_MARKER, isMeta: true }),
+      ...sliced,
+    ]
+  }
+  return sliced
+}
+
+/**
+ * Input budget that leaves the summarizer at least `minSummaryTokens` of
+ * output room inside the effective window.
+ */
+export function getCompactInputBudgetTokens(
+  model: string,
+  minSummaryTokens: number = MIN_COMPACT_SUMMARY_TOKENS,
+): number {
+  return (
+    getContextWindowForModel(model) -
+    COMPACT_INPUT_SAFETY_BUFFER_TOKENS -
+    minSummaryTokens
+  )
+}
 export const ERROR_MESSAGE_USER_ABORT = 'API Error: Request was aborted.'
 export const ERROR_MESSAGE_INCOMPLETE_RESPONSE =
   'Compaction interrupted · This may be due to network issues — please try again.'
+
+/**
+ * Output budget reserved for the summary itself. Below this the summarizer
+ * gets cut mid-sentence and the resulting "summary" loses most of the
+ * conversation, so the request is truncated down before sending instead.
+ */
+export const MIN_COMPACT_SUMMARY_TOKENS = 8_192
+
+/** Headroom kept inside the window when sizing the summarizer's input. */
+const COMPACT_INPUT_SAFETY_BUFFER_TOKENS = 1_024
+
+export const ERROR_MESSAGE_SUMMARY_TRUNCATED =
+  'Compaction produced a truncated summary even after dropping the oldest history. Free some context (raise maxContextTokens or start a new session) and retry.'
 
 /**
  * The summarization call itself returned an API error. Surfacing it as a
@@ -481,7 +580,30 @@ export async function compactConversation(
     let summaryResponse: AssistantMessage
     let summary: string | null
     let ptlAttempts = 0
+    // Leave the summarizer real output room: a summary cut at a few hundred
+    // tokens loses most of the conversation, and the PTL loop never sees it
+    // (the response is not an error message).
+    const compactInputBudget = getCompactInputBudgetTokens(
+      context.options.mainLoopModel,
+    )
     for (;;) {
+      const fitted = truncateHeadToTokenBudget(
+        messagesToSummarize,
+        compactInputBudget,
+      )
+      if (fitted && fitted !== messagesToSummarize) {
+        logEvent('tengu_compact_input_truncated_for_budget', {
+          droppedMessages: messagesToSummarize.length - fitted.length,
+          inputBudget:
+            compactInputBudget as unknown as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        })
+        messagesToSummarize = fitted
+        retryCacheSafeParams = {
+          ...retryCacheSafeParams,
+          forkContextMessages: fitted,
+        }
+      }
+
       summaryResponse = await streamCompactSummary({
         messages: messagesToSummarize,
         summaryRequest,
@@ -491,24 +613,39 @@ export async function compactConversation(
         cacheSafeParams: retryCacheSafeParams,
       })
       summary = getAssistantMessageText(summaryResponse)
-      if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
+      const summaryTruncated = isTruncatedSummaryResponse(summaryResponse)
+      if (
+        !summaryTruncated &&
+        !summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)
+      ) {
+        break
+      }
 
-      // CC-1180: compact request itself hit prompt-too-long. Truncate the
-      // oldest API-round groups and retry rather than leaving the user stuck.
       ptlAttempts++
+      // Truncated output: shrink the input below budget so the retry has room.
+      // Each attempt tightens the target (70% of the last), because the first
+      // retry may already fit the budget on paper while the server still cuts.
+      const retryBudget = Math.floor(compactInputBudget * 0.7 ** ptlAttempts)
       const truncated =
         ptlAttempts <= MAX_PTL_RETRIES
-          ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
+          ? summaryTruncated
+            ? truncateHeadToTokenBudget(messagesToSummarize, retryBudget)
+            : truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
           : null
-      if (!truncated) {
+      if (!truncated || truncated === messagesToSummarize) {
         logEvent('tengu_compact_failed', {
-          reason:
-            'prompt_too_long' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+          reason: (summaryTruncated
+            ? 'summary_truncated'
+            : 'prompt_too_long') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
           preCompactTokenCount,
           promptCacheSharingEnabled,
           ptlAttempts,
         })
-        throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
+        throw new Error(
+          summaryTruncated
+            ? ERROR_MESSAGE_SUMMARY_TRUNCATED
+            : ERROR_MESSAGE_PROMPT_TOO_LONG,
+        )
       }
       logEvent('tengu_compact_ptl_retry', {
         attempt: ptlAttempts,
@@ -898,7 +1035,25 @@ export async function partialCompactConversation(
     let summaryResponse: AssistantMessage
     let summary: string | null
     let ptlAttempts = 0
+    const partialInputBudget = getCompactInputBudgetTokens(
+      context.options.mainLoopModel,
+    )
     for (;;) {
+      const fitted = truncateHeadToTokenBudget(apiMessages, partialInputBudget)
+      if (fitted && fitted !== apiMessages) {
+        logEvent('tengu_compact_input_truncated_for_budget', {
+          droppedMessages: apiMessages.length - fitted.length,
+          inputBudget:
+            partialInputBudget as unknown as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+          path: 'partial' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        })
+        apiMessages = fitted
+        retryCacheSafeParams = {
+          ...retryCacheSafeParams,
+          forkContextMessages: fitted,
+        }
+      }
+
       summaryResponse = await streamCompactSummary({
         messages: apiMessages,
         summaryRequest,
@@ -908,21 +1063,37 @@ export async function partialCompactConversation(
         cacheSafeParams: retryCacheSafeParams,
       })
       summary = getAssistantMessageText(summaryResponse)
-      if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
+      const summaryTruncated = isTruncatedSummaryResponse(summaryResponse)
+      if (
+        !summaryTruncated &&
+        !summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)
+      ) {
+        break
+      }
 
       ptlAttempts++
+      const partialRetryBudget = Math.floor(
+        partialInputBudget * 0.7 ** ptlAttempts,
+      )
       const truncated =
         ptlAttempts <= MAX_PTL_RETRIES
-          ? truncateHeadForPTLRetry(apiMessages, summaryResponse)
+          ? summaryTruncated
+            ? truncateHeadToTokenBudget(apiMessages, partialRetryBudget)
+            : truncateHeadForPTLRetry(apiMessages, summaryResponse)
           : null
-      if (!truncated) {
+      if (!truncated || truncated === apiMessages) {
         logEvent('tengu_partial_compact_failed', {
-          reason:
-            'prompt_too_long' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+          reason: (summaryTruncated
+            ? 'summary_truncated'
+            : 'prompt_too_long') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
           ...failureMetadata,
           ptlAttempts,
         })
-        throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
+        throw new Error(
+          summaryTruncated
+            ? ERROR_MESSAGE_SUMMARY_TRUNCATED
+            : ERROR_MESSAGE_PROMPT_TOO_LONG,
+        )
       }
       logEvent('tengu_compact_ptl_retry', {
         attempt: ptlAttempts,
