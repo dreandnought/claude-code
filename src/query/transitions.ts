@@ -1,6 +1,7 @@
 export type Terminal =
   | { reason: 'completed' }
   | { reason: 'blocking_limit' }
+  | { reason: 'budget_starved' }
   | { reason: 'image_error' }
   | { reason: 'model_error'; error?: unknown }
   | { reason: 'aborted_streaming' }
@@ -13,6 +14,7 @@ export type Terminal =
 export type Continue =
   | { reason: 'collapse_drain_retry'; committed: number }
   | { reason: 'reactive_compact_retry' }
+  | { reason: 'budget_starvation_compact_retry' }
   | { reason: 'max_output_tokens_escalate' }
   | { reason: 'max_output_tokens_recovery'; attempt: number }
   | { reason: 'stop_hook_blocking' }

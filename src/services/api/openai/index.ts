@@ -60,10 +60,23 @@ export {
   buildOpenAIRequestBody,
 }
 import {
-  clampMaxOutputTokensToWindow,
-  estimateTokensFromPayload,
+  formatBudgetStarvationMessage,
   getModelMaxOutputTokens,
+  getRequestBudget,
+  type RequestBudget,
 } from '../../../utils/context.js'
+import { API_ERROR_MESSAGE_PREFIX } from '../errors.js'
+import {
+  OUTPUT_API_ERROR_BUDGET_STARVED,
+  OUTPUT_API_ERROR_MAX_TOKENS,
+  OUTPUT_API_ERROR_WINDOW_LIMITED,
+} from '../../../utils/outputBudget.js'
+
+/**
+ * Below this output budget, thinking consumes the whole allowance and the
+ * user-visible answer comes back empty. Thinking is disabled for that request.
+ */
+const MIN_REASONING_BUDGET_TOKENS = 2_048
 import type { Options } from '../claude.js'
 import { withQueueHints } from '../vllmQueue/gate.js'
 import { randomUUID } from 'crypto'
@@ -164,6 +177,8 @@ function assembleFinalAssistantOutputs(params: {
   }
   stopReason: string | null
   maxTokens: number
+  /** Budget for this request; drives window-limited wording. */
+  budget?: RequestBudget
 }): (AssistantMessage | SystemAPIErrorMessage)[] {
   const {
     partialMessage,
@@ -173,6 +188,7 @@ function assembleFinalAssistantOutputs(params: {
     usage,
     stopReason,
     maxTokens,
+    budget,
   } = params
   const outputs: (AssistantMessage | SystemAPIErrorMessage)[] = []
 
@@ -202,12 +218,21 @@ function assembleFinalAssistantOutputs(params: {
   }
 
   if (stopReason === 'max_tokens') {
+    const windowLimited =
+      budget?.windowLimited === true && maxTokens === budget.maxOutput
     outputs.push(
       createAssistantAPIErrorMessage({
         content:
-          `Output truncated: response exceeded the ${maxTokens} token limit. ` +
-          `Set OPENAI_MAX_TOKENS or CLAUDE_CODE_MAX_OUTPUT_TOKENS to override.`,
-        apiError: 'max_output_tokens',
+          windowLimited && budget
+            ? `${API_ERROR_MESSAGE_PREFIX}: Response stopped at the ${maxTokens}-token output ceiling, ` +
+              `which is all the ${budget.window}-token window has left ` +
+              `(${budget.estimatedInput} tokens in context). ` +
+              `Run /compact to free context, then retry.`
+            : `Output truncated: response exceeded the ${maxTokens} token limit. ` +
+              `Set OPENAI_MAX_TOKENS or CLAUDE_CODE_MAX_OUTPUT_TOKENS to override.`,
+        apiError: windowLimited
+          ? OUTPUT_API_ERROR_WINDOW_LIMITED
+          : OUTPUT_API_ERROR_MAX_TOKENS,
         error: 'max_output_tokens',
       }),
     )
@@ -355,15 +380,38 @@ export async function* queryModelOpenAI(
     // reject any request where input + max_tokens exceeds the window, so a
     // fixed 64k budget fails as soon as the conversation is 70k+ tokens long
     // on a 131k model.
-    const maxTokens = clampMaxOutputTokensToWindow(
-      openaiModel,
-      resolveOpenAIMaxTokens(upperLimit, options.maxOutputTokensOverride),
-      estimateTokensFromPayload({
-        system: systemPrompt,
-        messages: openaiMessages,
-        tools: openaiTools,
-      }),
+    const requestedMaxTokens = resolveOpenAIMaxTokens(
+      upperLimit,
+      options.maxOutputTokensOverride,
     )
+    const budget = getRequestBudget(
+      openaiModel,
+      { system: systemPrompt, messages: openaiMessages, tools: openaiTools },
+      requestedMaxTokens,
+    )
+    const maxTokens = budget.maxOutput
+
+    // Pre-dispatch gate: a starved budget produces a few hundred tokens of
+    // answer and then three continuation retries that re-send the full
+    // context. Refuse before the fetch instead.
+    if (budget.starved) {
+      logForDebugging(
+        `[budget] refusing request: window=${budget.window} (${budget.windowSource}) estInput=${budget.estimatedInput} maxOutput=${budget.maxOutput}`,
+        { level: 'warn' },
+      )
+      yield createAssistantAPIErrorMessage({
+        content: formatBudgetStarvationMessage(budget),
+        apiError: OUTPUT_API_ERROR_BUDGET_STARVED,
+        error: 'max_output_tokens',
+      })
+      return
+    }
+
+    // Thinking keeps consuming the whole budget on OpenAI-compatible
+    // endpoints when the window clamps max_tokens down. Below a usable
+    // reasoning floor the answer would be empty, so disable it for this turn.
+    const effectiveThinking =
+      enableThinking && maxTokens >= MIN_REASONING_BUDGET_TOKENS
 
     const useChatGPTResponses = isChatGPTAuthEnabled()
     // OpenAI's official OAuth and API-key routes share the same prompt-cache
@@ -421,7 +469,7 @@ export async function* queryModelOpenAI(
                 messages: openaiMessages,
                 tools: openaiTools,
                 toolChoice: openaiToolChoice,
-                enableThinking,
+                enableThinking: effectiveThinking,
                 maxTokens,
                 temperatureOverride: options.temperatureOverride,
                 promptCacheKey,
@@ -525,6 +573,7 @@ export async function* queryModelOpenAI(
               usage,
               stopReason,
               maxTokens,
+              budget,
             })) {
               if (output.type === 'assistant') {
                 collectedMessages.push(output)
@@ -575,7 +624,7 @@ export async function* queryModelOpenAI(
       endTime: new Date(),
       completionStartTime: ttftMs > 0 ? new Date(start + ttftMs) : undefined,
       tools: convertToolsToLangfuse(toolSchemas as unknown[]),
-      ...(enableThinking && { thinking: { type: 'enabled' } }),
+      ...(effectiveThinking && { thinking: { type: 'enabled' } }),
     })
 
     // Safety: if stream ended without message_stop, assemble and yield whatever we have
@@ -588,6 +637,7 @@ export async function* queryModelOpenAI(
         usage,
         stopReason,
         maxTokens,
+        budget,
       })) {
         yield output
       }

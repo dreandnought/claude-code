@@ -27,6 +27,10 @@ import {
 } from 'src/services/analytics/index.js'
 import { ImageSizeError } from './utils/imageValidation.js'
 import { ImageResizeError } from './utils/imageResizer.js'
+import {
+  isBudgetStarvation,
+  isWithheldMaxOutputTokens as isWithheldMaxOutputTokensMessage,
+} from './utils/outputBudget.js'
 import { findToolByName, type ToolUseContext } from './Tool.js'
 import { asSystemPrompt, type SystemPrompt } from './utils/systemPromptType.js'
 import type {
@@ -205,7 +209,7 @@ const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 function isWithheldMaxOutputTokens(
   msg: Message | StreamEvent | undefined,
 ): msg is AssistantMessage {
-  return msg?.type === 'assistant' && msg.apiError === 'max_output_tokens'
+  return isWithheldMaxOutputTokensMessage(msg)
 }
 
 function getAutonomyTurnOutcome(params: {
@@ -455,6 +459,11 @@ async function* queryLoop(
     state.messages,
     state.toolUseContext,
   )
+
+  // One compaction attempt per turn for window-limited output. Retrying
+  // without shrinking the history reproduces the same cut, and each attempt
+  // re-sends the full context.
+  let budgetLimitedCompactAttempted = false
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -1073,6 +1082,9 @@ async function* queryLoop(
             if (isWithheldMaxOutputTokens(message)) {
               withheld = true
             }
+            if (isBudgetStarvation(message)) {
+              withheld = true
+            }
             if (!withheld) {
               yield yieldMessage
             }
@@ -1467,6 +1479,73 @@ async function* queryLoop(
         yield lastMessage
         void executeStopFailureHooks(lastMessage, toolUseContext)
         return { reason: 'prompt_too_long' }
+      }
+
+      // Window-limited output. The ceiling is whatever context leaves, so a
+      // continuation retry is cut in the same place and re-sends the entire
+      // context each time. Compact once, then let the next iteration budget
+      // against the shorter history.
+      if (
+        isBudgetStarvation(lastMessage) &&
+        lastMessage?.type === 'assistant'
+      ) {
+        const starvedMessage = lastMessage as AssistantMessage
+        if (!budgetLimitedCompactAttempted && isAutoCompactEnabled()) {
+          budgetLimitedCompactAttempted = true
+          logEvent('tengu_output_budget_compact_retry', {
+            apiError:
+              starvedMessage.apiError as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            preCompactTokens: tokenCountWithEstimation(
+              messagesForQuery,
+            ) as unknown as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+          })
+          const budgetResult = await deps.autocompact(
+            messagesForQuery,
+            toolUseContext,
+            {
+              systemPrompt,
+              userContext,
+              systemContext,
+              toolUseContext,
+              forkContextMessages: messagesForQuery,
+            },
+            querySource,
+            tracking,
+            snipTokensFreed,
+          )
+          if (budgetResult.compactionResult) {
+            const postCompactMessages = buildPostCompactMessages(
+              budgetResult.compactionResult,
+            )
+            messagesForQuery = postCompactMessages
+            snipTokensFreed = 0
+            tracking = tracking
+              ? {
+                  ...tracking,
+                  compacted: true,
+                  consecutiveFailures: budgetResult.consecutiveFailures ?? 0,
+                }
+              : tracking
+            state = {
+              messages: postCompactMessages,
+              toolUseContext,
+              autoCompactTracking: tracking,
+              maxOutputTokensRecoveryCount,
+              hasAttemptedReactiveCompact,
+              maxOutputTokensOverride: undefined,
+              pendingToolUseSummary: undefined,
+              stopHookActive: undefined,
+              turnCount,
+              transition: { reason: 'budget_starvation_compact_retry' },
+            }
+            continue
+          }
+        }
+        // Compaction unavailable, already attempted, or failed: surface the
+        // error with the actionable message the request builder produced.
+        yield starvedMessage
+        void executeStopFailureHooks(starvedMessage, toolUseContext)
+        return { reason: 'budget_starved' }
       }
 
       // Check for max_output_tokens and inject recovery message. The error

@@ -66,14 +66,19 @@ import {
 import { getOrCreateUserID } from '../../utils/config.js'
 import {
   CAPPED_DEFAULT_MAX_TOKENS,
-  clampMaxOutputTokensToWindow,
-  estimateTokensFromPayload,
+  formatBudgetStarvationMessage,
   getModelMaxOutputTokens,
+  getRequestBudget,
   getSonnet1mExpTreatmentEnabled,
+  type RequestBudget,
 } from '../../utils/context.js'
 import { resolveAppliedEffort } from '../../utils/effort.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import { errorMessage } from '../../utils/errors.js'
+import {
+  OUTPUT_API_ERROR_BUDGET_STARVED,
+  OUTPUT_API_ERROR_WINDOW_LIMITED,
+} from '../../utils/outputBudget.js'
 import { captureAPIRequest, logError } from '../../utils/log.js'
 import {
   createAssistantAPIErrorMessage,
@@ -1623,6 +1628,11 @@ async function* queryModel(
   // were dynamically added, so we can log and send it to telemetry.
   let lastRequestBetas: string[] | undefined
 
+  // Budget for the most recent paramsFromContext() call. Read by the
+  // pre-dispatch gate (starved requests are never sent) and by the max_tokens
+  // error path (window-limited cuts get context-aware text).
+  let requestBudget: RequestBudget | undefined
+
   const paramsFromContext = (retryContext: RetryContext) => {
     const betasParams = [...betas]
 
@@ -1681,15 +1691,14 @@ async function* queryModel(
     // Never request more output than the window has room for. Endpoints that
     // count input + max_tokens against the limit reject the whole request as
     // "input too large" otherwise, even when the input alone would fit.
-    const clampedMaxOutputTokens = clampMaxOutputTokensToWindow(
+    const budget = getRequestBudget(
       options.model,
+      { system, messages: messagesForAPI, tools: allTools },
       maxOutputTokens,
-      estimateTokensFromPayload({
-        system,
-        messages: messagesForAPI,
-        tools: allTools,
-      }),
+      betasParams,
     )
+    const clampedMaxOutputTokens = budget.maxOutput
+    requestBudget = budget
 
     const hasThinking =
       thinkingConfig.type !== 'disabled' &&
@@ -1724,6 +1733,32 @@ async function* queryModel(
           budget_tokens: thinkingBudget,
           type: 'enabled',
         } satisfies BetaMessageStreamParams['thinking']
+      }
+    }
+
+    // The API requires max_tokens > thinking.budget_tokens. A window clamp can
+    // land beneath the budget the config asked for; shrink it (or drop
+    // thinking) only when the clamp actually bit, so ordinary requests keep
+    // cache-stable params.
+    if (
+      budget.windowLimited &&
+      thinking?.type === 'enabled' &&
+      thinking.budget_tokens >= clampedMaxOutputTokens
+    ) {
+      if (clampedMaxOutputTokens <= 1_024) {
+        logForDebugging(
+          `[budget] dropping thinking: max_tokens clamped to ${clampedMaxOutputTokens} cannot cover thinking budget ${thinking.budget_tokens}`,
+          { level: 'warn' },
+        )
+        thinking = { type: 'disabled' }
+      } else {
+        logForDebugging(
+          `[budget] shrinking thinking budget ${thinking.budget_tokens} -> ${clampedMaxOutputTokens - 1} (max_tokens clamped by window)`,
+        )
+        thinking = {
+          ...thinking,
+          budget_tokens: clampedMaxOutputTokens - 1,
+        }
       }
     }
 
@@ -1845,6 +1880,32 @@ async function* queryModel(
       model: options.model,
       thinkingConfig,
     })
+
+    // Pre-dispatch budget gate. When the window leaves no usable output, a
+    // request would come back cut at a few hundred tokens and then trigger
+    // three continuation retries that each re-send the full context. Refuse it
+    // here instead: no network call, no retries, one actionable message.
+    if (requestBudget?.starved) {
+      logEvent('tengu_output_budget_starved', {
+        window: requestBudget.window,
+        windowSource:
+          requestBudget.windowSource as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        estimatedInput: requestBudget.estimatedInput,
+        requestedOutput: requestBudget.requestedOutput,
+        maxOutput: requestBudget.maxOutput,
+      })
+      logForDebugging(
+        `[budget] refusing request: window=${requestBudget.window} (${requestBudget.windowSource}) estInput=${requestBudget.estimatedInput} maxOutput=${requestBudget.maxOutput}`,
+        { level: 'warn' },
+      )
+      yield createAssistantAPIErrorMessage({
+        content: formatBudgetStarvationMessage(requestBudget),
+        apiError: OUTPUT_API_ERROR_BUDGET_STARVED,
+        error: 'max_output_tokens',
+      })
+      return
+    }
+
     const logMessagesLength = queryParams.messages.length
     const logBetas = useBetas ? (queryParams.betas ?? []) : []
     const logEffortValue = queryParams.output_config?.effort
@@ -2391,13 +2452,31 @@ async function* queryModel(
               logEvent('tengu_max_tokens_reached', {
                 max_tokens: maxOutputTokens,
               })
-              yield createAssistantAPIErrorMessage({
-                content: `${API_ERROR_MESSAGE_PREFIX}: Claude's response exceeded the ${
-                  maxOutputTokens
-                } output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.`,
-                apiError: 'max_output_tokens',
-                error: 'max_output_tokens',
-              })
+              // Window-limited cuts cannot be fixed by raising the output env
+              // var — the clamp runs after it. Say so instead of pointing at a
+              // dead end, and let query.ts route this to compaction.
+              const windowLimited =
+                requestBudget?.windowLimited === true &&
+                maxOutputTokens === requestBudget.maxOutput
+              if (windowLimited && requestBudget) {
+                yield createAssistantAPIErrorMessage({
+                  content:
+                    `${API_ERROR_MESSAGE_PREFIX}: Response stopped at the ${maxOutputTokens}-token output ceiling, ` +
+                    `which is all the ${requestBudget.window}-token window has left ` +
+                    `(${requestBudget.estimatedInput} tokens in context). ` +
+                    `Run /compact to free context, then retry.`,
+                  apiError: OUTPUT_API_ERROR_WINDOW_LIMITED,
+                  error: 'max_output_tokens',
+                })
+              } else {
+                yield createAssistantAPIErrorMessage({
+                  content: `${API_ERROR_MESSAGE_PREFIX}: Claude's response exceeded the ${
+                    maxOutputTokens
+                  } output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.`,
+                  apiError: 'max_output_tokens',
+                  error: 'max_output_tokens',
+                })
+              }
             }
 
             if (stopReason === 'model_context_window_exceeded') {

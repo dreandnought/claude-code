@@ -21,6 +21,21 @@ export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
 // Maximum output tokens for compact operations
 export const COMPACT_MAX_OUTPUT_TOKENS = 20_000
 
+/**
+ * Below this, an output budget cannot produce a usable answer. Requests whose
+ * window-clamped budget falls under this floor are reported as starved instead
+ * of being sent: a response cut at a few hundred tokens burns a full-context
+ * round trip and, in a multi-turn loop, three continuation retries on top.
+ */
+export const MIN_USABLE_OUTPUT_TOKENS = 4_096
+
+// Headroom subtracted from the window when sizing the output budget, so the
+// server never sees input + max_tokens sitting exactly on the limit.
+const OUTPUT_SAFETY_BUFFER_TOKENS = 1_024
+
+// Hard API floor: max_tokens must stay positive.
+const MIN_OUTPUT_TOKENS_FLOOR = 512
+
 // Default max output tokens
 const MAX_OUTPUT_TOKENS_DEFAULT = 32_000
 const MAX_OUTPUT_TOKENS_UPPER_LIMIT = 64_000
@@ -62,31 +77,82 @@ export function modelSupports1M(model: string): boolean {
   )
 }
 
-export function getContextWindowForModel(
+/**
+ * Where the effective window number came from. Surfaced in /context and debug
+ * logs so a deployment flip (240k vs 262k) can be traced to one source.
+ */
+export type ContextWindowSource =
+  | 'env'
+  | 'model-map'
+  | 'observed'
+  | 'settings-cap'
+  | 'model'
+  | 'default'
+
+function resolveContextWindow(
   model: string,
   betas?: string[],
-): number {
+): { window: number; source: ContextWindowSource } {
   // 1) Per-model override from settings.json / observed server limit.
   //    Both are "what the endpoint really has", so take the most restrictive.
   const configured = getSettingsContextWindowOverride(model)
   const observed = getObservedContextLimit(model)
-  let resolved: number
+  let window: number
+  let source: ContextWindowSource
   if (configured !== undefined && observed !== undefined) {
-    resolved = Math.min(configured, observed)
+    if (configured <= observed) {
+      window = configured
+      source = 'model-map'
+    } else {
+      window = observed
+      source = 'observed'
+    }
   } else if (configured !== undefined) {
-    resolved = configured
+    window = configured
+    source = 'model-map'
   } else if (observed !== undefined) {
-    resolved = observed
+    window = observed
+    source = 'observed'
   } else {
-    resolved = resolveContextWindowRaw(model, betas)
+    window = resolveContextWindowRaw(model, betas)
+    const envOverride = parseInt(
+      process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS ?? '',
+      10,
+    )
+    if (
+      Number.isFinite(envOverride) &&
+      envOverride > 0 &&
+      window === envOverride
+    ) {
+      source = 'env'
+    } else if (window === MODEL_CONTEXT_WINDOW_DEFAULT) {
+      source = 'default'
+    } else {
+      source = 'model'
+    }
   }
 
   // 2) Optional global cap (e.g. keep a 1M model compacting at 150k).
   const cap = getSettingsMaxContextCap()
-  if (cap !== undefined) {
-    resolved = Math.min(resolved, cap)
+  if (cap !== undefined && cap < window) {
+    window = cap
+    source = 'settings-cap'
   }
-  return resolved
+  return { window, source }
+}
+
+export function getContextWindowForModel(
+  model: string,
+  betas?: string[],
+): number {
+  return resolveContextWindow(model, betas).window
+}
+
+export function getContextWindowSource(
+  model: string,
+  betas?: string[],
+): ContextWindowSource {
+  return resolveContextWindow(model, betas).source
 }
 
 const overrideMemo = new Map<string, number | undefined>()
@@ -145,18 +211,91 @@ export function estimateTokensFromPayload(payload: unknown): number {
  * is N tokens" errors on OpenAI-compatible endpoints, which otherwise get a
  * fixed 64k max_tokens request regardless of their window.
  */
+function clampOutputToWindow(
+  window: number,
+  requestedOutput: number,
+  estimatedInputTokens: number,
+): number {
+  if (!Number.isFinite(window) || window <= 0) return requestedOutput
+  const available = window - estimatedInputTokens - OUTPUT_SAFETY_BUFFER_TOKENS
+  if (available >= requestedOutput) return requestedOutput
+  return Math.max(MIN_OUTPUT_TOKENS_FLOOR, Math.floor(available))
+}
+
 export function clampMaxOutputTokensToWindow(
   model: string,
   configuredMaxTokens: number,
   estimatedInputTokens: number,
 ): number {
-  const MIN_OUTPUT_TOKENS = 512
-  const SAFETY_BUFFER_TOKENS = 1_024
-  const window = getContextWindowForModel(model)
-  if (!Number.isFinite(window) || window <= 0) return configuredMaxTokens
-  const available = window - estimatedInputTokens - SAFETY_BUFFER_TOKENS
-  if (available >= configuredMaxTokens) return configuredMaxTokens
-  return Math.max(MIN_OUTPUT_TOKENS, Math.floor(available))
+  return clampOutputToWindow(
+    resolveContextWindow(model).window,
+    configuredMaxTokens,
+    estimatedInputTokens,
+  )
+}
+
+/**
+ * The single source of truth for "what can this request actually send".
+ *
+ * Both the request builders (claude.ts Anthropic path, openai/index.ts) and the
+ * pre-dispatch gate in query.ts use this, so the clamp and the starvation check
+ * can never disagree about the same payload.
+ */
+export type RequestBudget = {
+  /** Effective window after modelContextWindows / observed / maxContextTokens. */
+  window: number
+  windowSource: ContextWindowSource
+  /** Payload estimate used for the clamp (same estimator as the request). */
+  estimatedInput: number
+  /** Output ceiling the caller asked for (env, override, or model default). */
+  requestedOutput: number
+  /** Output ceiling actually usable for this request. */
+  maxOutput: number
+  /** window − estimatedInput − safety buffer, may be negative. */
+  availableOutput: number
+  /** maxOutput was reduced by the window rather than the caller. */
+  windowLimited: boolean
+  /** maxOutput cannot produce a usable answer; do not dispatch the request. */
+  starved: boolean
+}
+
+export function getRequestBudget(
+  model: string,
+  payload: unknown,
+  requestedOutput: number,
+  betas?: string[],
+): RequestBudget {
+  const { window, source } = resolveContextWindow(model, betas)
+  const estimatedInput = estimateTokensFromPayload(payload)
+  const availableOutput = Math.floor(
+    window - estimatedInput - OUTPUT_SAFETY_BUFFER_TOKENS,
+  )
+  const maxOutput = clampOutputToWindow(window, requestedOutput, estimatedInput)
+  return {
+    window,
+    windowSource: source,
+    estimatedInput,
+    requestedOutput,
+    maxOutput,
+    availableOutput,
+    windowLimited: maxOutput < requestedOutput,
+    starved: maxOutput < Math.min(MIN_USABLE_OUTPUT_TOKENS, requestedOutput),
+  }
+}
+
+/**
+ * User-facing text for a request that was refused before dispatch. Names the
+ * window, the usage that caused it, and the two knobs that actually change the
+ * outcome — the output-token env var cannot, because the clamp runs after it.
+ */
+export function formatBudgetStarvationMessage(budget: RequestBudget): string {
+  const pct = Math.round((budget.estimatedInput / budget.window) * 100)
+  return (
+    `API Error: Context is at ~${pct}% of the ${budget.window}-token window ` +
+    `(${budget.estimatedInput} tokens used, ${budget.maxOutput} left for output). ` +
+    `This request was not sent. Run /compact or start a new session; ` +
+    `to enlarge the usable window, raise maxContextTokens in settings.json.`
+  )
 }
 
 function resolveContextWindowRaw(model: string, betas?: string[]): number {

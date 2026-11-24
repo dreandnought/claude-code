@@ -302,6 +302,16 @@ export const ERROR_MESSAGE_USER_ABORT = 'API Error: Request was aborted.'
 export const ERROR_MESSAGE_INCOMPLETE_RESPONSE =
   'Compaction interrupted · This may be due to network issues — please try again.'
 
+/**
+ * The summarization call itself returned an API error. Surfacing it as a
+ * compaction failure is the only safe outcome: the error text would otherwise
+ * become the conversation's summary and every later turn would be primed with
+ * it. The cache-sharing branch already guards this (see isApiErrorMessage
+ * check below); the streaming fallback is the path that used to accept it.
+ */
+export const ERROR_MESSAGE_COMPACT_API_ERROR =
+  'Compaction failed: the summary request returned an API error. Free some context (raise the budget or shorten the conversation) and retry.'
+
 export interface CompactionResult {
   boundaryMarker: SystemMessage
   summaryMessages: UserMessage[]
@@ -1409,6 +1419,20 @@ async function streamCompactSummary({
       }
 
       if (response) {
+        // An API error message is not a summary. Accepting it replaces the
+        // conversation with the error text and poisons every later turn.
+        if (response.isApiErrorMessage) {
+          logForDebugging(
+            `Compact failed: summary request returned an API error: ${getAssistantMessageText(response) ?? 'unknown'}`,
+            { level: 'error' },
+          )
+          logEvent('tengu_compact_failed', {
+            reason:
+              'api_error' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            preCompactTokenCount,
+          })
+          throw new Error(ERROR_MESSAGE_COMPACT_API_ERROR)
+        }
         return response
       }
 
