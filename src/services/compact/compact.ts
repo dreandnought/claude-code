@@ -9,7 +9,7 @@ const sessionTranscriptModule = feature('KAIROS')
 
 import { APIUserAbortError } from '@anthropic-ai/sdk'
 import { markPostCompaction } from 'src/bootstrap/state.js'
-import { getInvokedSkillsForAgent } from '../../bootstrap/state.js'
+import { getInvokedSkillsForAgent, getSdkBetas } from '../../bootstrap/state.js'
 import type { QuerySource } from '../../constants/querySource.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import type { Tool, ToolUseContext } from '../../Tool.js'
@@ -377,9 +377,10 @@ export function truncateHeadToTokenBudget(
 export function getCompactInputBudgetTokens(
   model: string,
   minSummaryTokens: number = MIN_COMPACT_SUMMARY_TOKENS,
+  betas: string[] | undefined = getSdkBetas(),
 ): number {
   return (
-    getContextWindowForModel(model) -
+    getContextWindowForModel(model, betas) -
     COMPACT_INPUT_SAFETY_BUFFER_TOKENS -
     minSummaryTokens
   )

@@ -29,6 +29,7 @@ import {
   MIN_COMPACT_SUMMARY_TOKENS,
 } from '../../src/services/compact/compact'
 import { MAX_TOOL_RESULTS_PER_MESSAGE_TOKENS } from '../../src/constants/toolLimits'
+import { CONTEXT_1M_BETA_HEADER } from '../../src/constants/betas'
 import { getPerMessageBudgetLimitTokens } from '../../src/utils/toolResultStorage'
 import {
   clearObservedContextLimits,
@@ -90,6 +91,44 @@ describe('CJK-aware token estimation', () => {
     expect(est).toBeGreaterThanOrEqual(4_000)
     expect(est).toBeLessThan(4_300)
   })
+
+  // 回归：图片 base64 不能按字符数计入预算，否则图片会话会被误判 starved。
+  test('image payloads count per-image, not base64 length', () => {
+    const base64 = 'A'.repeat(400_000) // ~100k tokens if counted as text
+    const anthropic = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'look' },
+            {
+              type: 'image',
+              source: { type: 'base64', media_type: 'image/png', data: base64 },
+            },
+          ],
+        },
+      ],
+    }
+    const openai = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'look' },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${base64}` },
+            },
+          ],
+        },
+      ],
+    }
+    for (const payload of [anthropic, openai]) {
+      const est = estimateTokensFromPayload(payload)
+      expect(est).toBeLessThan(2_000) // 1 text token + one 1600-token image
+      expect(est).toBeGreaterThanOrEqual(1_600)
+    }
+  })
 })
 
 describe('compact input budget', () => {
@@ -110,6 +149,24 @@ describe('compact input budget', () => {
     expect(getCompactInputBudgetTokens('b2-cap-model')).toBe(
       240_000 - 1_024 - MIN_COMPACT_SUMMARY_TOKENS,
     )
+  })
+
+  // 回归：compact 必须与 autoCompact/其余调用点一样按实际 betas 取窗口。
+  // 1M beta 会话曾因这里漏传 betas 按 200k 裁输入，摘要被过度截断。
+  test('1M beta window is honored instead of falling back to 200k', () => {
+    const withBeta = getCompactInputBudgetTokens(
+      'claude-sonnet-4-6',
+      MIN_COMPACT_SUMMARY_TOKENS,
+      [CONTEXT_1M_BETA_HEADER],
+    )
+    expect(withBeta).toBe(1_000_000 - 1_024 - MIN_COMPACT_SUMMARY_TOKENS)
+
+    const withoutBeta = getCompactInputBudgetTokens(
+      'claude-sonnet-4-6',
+      MIN_COMPACT_SUMMARY_TOKENS,
+      undefined,
+    )
+    expect(withoutBeta).toBe(200_000 - 1_024 - MIN_COMPACT_SUMMARY_TOKENS)
   })
 })
 

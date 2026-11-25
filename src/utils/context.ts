@@ -14,7 +14,7 @@ import { getModelCapability } from './model/modelCapabilities.js'
 // merged settings snapshot from here does NOT create the
 // context → settings → growthbook → betas → context import cycle.
 import { getSessionSettingsCache } from './settings/settingsCache.js'
-import { estimateTokensForText } from './tokenRatio.js'
+import { estimateTokensForPayload } from './tokenRatio.js'
 
 // Model context window size (200k tokens for all models right now)
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -195,17 +195,13 @@ function getSettingsMaxContextCap(): number | undefined {
   return getSessionSettingsCache()?.settings?.maxContextTokens
 }
 
-/** Rough token estimate for a request payload (chars / 4). */
+/**
+ * Rough token estimate for a request payload. Text is CJK-aware (chars/4 for
+ * non-CJK); images are counted as a bounded per-image estimate rather than
+ * their base64 length, so image-heavy sessions are not misjudged as starved.
+ */
 export function estimateTokensFromPayload(payload: unknown): number {
-  try {
-    const json = typeof payload === 'string' ? payload : JSON.stringify(payload)
-    // CJK counts ~1 token/char; a plain length/4 estimate under-counts Chinese
-    // payloads by up to 4×, which is wide enough to skip the auto-compact
-    // threshold in a single turn.
-    return Math.ceil(estimateTokensForText(json))
-  } catch {
-    return 0
-  }
+  return estimateTokensForPayload(payload)
 }
 
 /**

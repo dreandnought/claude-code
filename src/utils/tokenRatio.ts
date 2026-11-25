@@ -60,3 +60,77 @@ export function estimateTokensForText(
   const other = text.length - cjk
   return Math.round(cjk + other / ratio)
 }
+
+/**
+ * Per-image input-token estimate used when sizing a request. Base64 payloads
+ * are thousands of characters per image but bill as ~1.6k tokens at most
+ * (Anthropic formula w*h/750, capped near 1.15MP). Counting the raw base64
+ * (chars/4) over-estimates an image ~100x and makes the pre-dispatch budget
+ * gate refuse image-heavy sessions that are actually well inside the window.
+ */
+export const IMAGE_INPUT_TOKEN_ESTIMATE = 1_600
+
+type SanitizedPayload = { value: unknown; images: number }
+
+function sanitizeImages(value: unknown): SanitizedPayload {
+  if (typeof value === 'string') {
+    return value.startsWith('data:image/')
+      ? { value: '', images: 1 }
+      : { value, images: 0 }
+  }
+  if (Array.isArray(value)) {
+    let images = 0
+    const out = value.map(item => {
+      const r = sanitizeImages(item)
+      images += r.images
+      return r.value
+    })
+    return { value: out, images }
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    // Anthropic image block and OpenAI image_url content part. Drop the
+    // payload entirely so the base64/media URL never reaches the estimator.
+    if (obj.type === 'image' || obj.type === 'image_url') {
+      return { value: { type: obj.type }, images: 1 }
+    }
+    let images = 0
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(obj)) {
+      const r = sanitizeImages(obj[key])
+      images += r.images
+      out[key] = r.value
+    }
+    return { value: out, images }
+  }
+  return { value, images: 0 }
+}
+
+/**
+ * Token estimate for a whole request payload.
+ *
+ * Text (including JSON punctuation) goes through `estimateTokensForText`;
+ * images are counted as `IMAGE_INPUT_TOKEN_ESTIMATE` each instead of their
+ * base64/URL character length. Payloads without images produce exactly the
+ * same number as before (the original value is stringified untouched).
+ */
+export function estimateTokensForPayload(payload: unknown): number {
+  try {
+    const sanitized = sanitizeImages(payload)
+    if (sanitized.images === 0) {
+      const json =
+        typeof payload === 'string' ? payload : JSON.stringify(payload)
+      return Math.ceil(estimateTokensForText(json))
+    }
+    const json =
+      typeof sanitized.value === 'string'
+        ? sanitized.value
+        : JSON.stringify(sanitized.value)
+    return Math.ceil(
+      estimateTokensForText(json) +
+        sanitized.images * IMAGE_INPUT_TOKEN_ESTIMATE,
+    )
+  } catch {
+    return 0
+  }
+}
