@@ -442,9 +442,14 @@ export async function* queryModelOpenAI(
       baseUrl: queueBaseUrl,
       querySource: options.querySource,
     })
+    // 只有真正启动的 gate 才包装流；NOOP 句柄下流对象保持原样（纯外挂）。
+    const gateStream = <T extends AsyncIterable<unknown>>(stream: T): T =>
+      queueHandle.active
+        ? gateStreamUntilFirstChunk(stream, queueHandle.dispose)
+        : stream
     const adaptedStream = useChatGPTResponses
       ? adaptResponsesStreamToAnthropic(
-          gateStreamUntilFirstChunk(
+          gateStream(
             await createChatGPTResponsesStream({
               request: buildResponsesRequest({
                 model: openaiModel,
@@ -460,12 +465,11 @@ export async function* queryModelOpenAI(
               queueHandle.dispose()
               throw err
             }),
-            queueHandle.dispose,
           ),
           openaiModel,
         )
       : adaptOpenAIStreamToAnthropic(
-          gateStreamUntilFirstChunk(
+          gateStream(
             await getOpenAIClient({
               maxRetries: 0,
               fetchOverride: options.fetchOverride as unknown as typeof fetch,
@@ -488,7 +492,6 @@ export async function* queryModelOpenAI(
                 queueHandle.dispose()
                 throw err
               }),
-            queueHandle.dispose,
           ),
           openaiModel,
           { includeCacheWriteTokens: useOfficialOpenAICache },

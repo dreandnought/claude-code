@@ -119,6 +119,20 @@ describe('attachQueueDisposeToBody (anthropic path)', () => {
     attachQueueDisposeToBody(res, c.dispose)
     expect(c.count()).toBe(1)
   })
+
+  // 回归：非流式 JSON（sideQuery/classifier）绝不能被排队包装锁住 body。
+  // 旧实现在 attach 时就 body.getReader()，导致 res.json() 抛
+  // "Body already used"，classifier 表现为 unavailable。
+  test('non-stream JSON body stays readable after attach (lazy reader)', async () => {
+    const c = counter()
+    const res = new Response(JSON.stringify({ ok: true }), {
+      headers: { 'content-type': 'application/json' },
+    })
+    attachQueueDisposeToBody(res, c.dispose)
+
+    const json = (await res.json()) as { ok: boolean }
+    expect(json.ok).toBe(true)
+  })
 })
 
 describe('gateStreamUntilFirstChunk (openai path)', () => {

@@ -408,7 +408,11 @@ function buildFetch(
       queueHandle = null
     }
     const result = inner(input, { ...init, headers })
-    if (queueHandle) {
+    // 只有真正启动的 gate 才允许触碰响应。NOOP 句柄（off/非本机/后台请求）
+    // 必须保持请求-响应对象原封不动 —— classifier 等 sideQuery 是非流式
+    // JSON，若在此包装 body 会锁住原始流，SDK 的 res.json() 直接抛
+    // "Body already used"，表现为 classifier unavailable。
+    if (queueHandle?.active) {
       const h = queueHandle
       // 响应头≠受理。实测 vLLM（Anthropic 端点）在请求仍在 waiting 时就先回
       // 200 + SSE 头（+0.15s），body 首块要等准入后才到（排队 100s+ 的请求
@@ -416,6 +420,12 @@ function buildFetch(
       // 以首个 body 数据块或流终止/错误为真正终点。
       void Promise.resolve(result)
         .then(res => {
+          // 仅 SSE 流可安全包装；非流式 JSON（sideQuery/classifier 等）在
+          // 响应头到达即结束观察，绝不改动 body。
+          if (!isEventStreamResponse(res)) {
+            h.dispose()
+            return res
+          }
           attachQueueDisposeToBody(res, h.dispose)
           return res
         })
@@ -425,9 +435,24 @@ function buildFetch(
   }
 }
 
+function isEventStreamResponse(res: Response): boolean {
+  try {
+    return (
+      res.headers
+        ?.get?.('content-type')
+        ?.toLowerCase()
+        .includes('text/event-stream') === true
+    )
+  } catch {
+    return false
+  }
+}
+
 /**
  * 把 gate 的 dispose 挂到响应 body 的首个数据块（或流终止/被取消）上。
  * 不改动 Response 的其他字段，只替换 body 为包了一层的流。
+ * 读取器延迟到首次 pull 才创建：即便调用方误用（非 SSE），也不会在
+ * attach 时就锁住原始 body 而破坏 res.json()/res.text()。
  * 任何异常都退化为立即 dispose，绝不影响主请求。
  */
 export function attachQueueDisposeToBody(
@@ -446,11 +471,13 @@ export function attachQueueDisposeToBody(
       done = true
       dispose()
     }
-    const reader = body.getReader()
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    const getReader = (): ReadableStreamDefaultReader<Uint8Array> =>
+      (reader ??= body.getReader())
     const wrapped = new ReadableStream<Uint8Array>({
       async pull(controller) {
         try {
-          const { done: streamDone, value } = await reader.read()
+          const { done: streamDone, value } = await getReader().read()
           if (streamDone) {
             finish()
             controller.close()
@@ -465,7 +492,7 @@ export function attachQueueDisposeToBody(
       },
       cancel(reason) {
         finish()
-        return reader.cancel(reason)
+        return getReader().cancel(reason)
       },
     })
     Object.defineProperty(res, 'body', {

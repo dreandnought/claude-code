@@ -387,6 +387,7 @@ vllm:request_queue_time_seconds_count 10
       deps,
     })
     await new Promise(r => setTimeout(r, 50))
+    expect(h.active).toBe(false)
     expect(fetchCount).toBe(0)
     expect(getQueueStatusSnapshot()).toBeNull()
     h.dispose()
@@ -404,9 +405,10 @@ vllm:request_queue_time_seconds_count 10
     h.dispose()
   })
 
-  test('background source: zero fetch, zero display', async () => {
+  test('background source: zero fetch, zero display, inactive handle', async () => {
     const h = withQueueHints({ baseUrl: BASE, querySource: 'title', deps })
     await new Promise(r => setTimeout(r, 50))
+    expect(h.active).toBe(false)
     expect(fetchCount).toBe(0)
     h.dispose()
   })

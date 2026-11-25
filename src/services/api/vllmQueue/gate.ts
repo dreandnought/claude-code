@@ -40,10 +40,15 @@ export interface GateOptions {
 }
 
 export interface QueueHandle {
+  /**
+   * 本句柄是否真的启动了排队观察。false 的句柄只用于让调用方统一 dispose，
+   * 调用方不得据此改动请求/响应对象（排队机制必须保持纯外挂，零侵入）。
+   */
+  active: boolean
   dispose: () => void
 }
 
-const NOOP: QueueHandle = { dispose: () => {} }
+const NOOP: QueueHandle = { active: false, dispose: () => {} }
 
 let keySeq = 0
 
@@ -121,6 +126,7 @@ export function withQueueHints(opts: GateOptions): QueueHandle {
   )
 
   return {
+    active: true,
     dispose: () => {
       if (stopped) return // 幂等：头/首块/错误多路径都可能触发
       stopped = true
