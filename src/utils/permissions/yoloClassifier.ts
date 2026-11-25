@@ -14,6 +14,10 @@ import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/gr
 import { logEvent } from '../../services/analytics/index.js'
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/metadata.js'
 import { getCacheControl } from '../../services/api/claude.js'
+import {
+  normalizeClassifierFields,
+  parseClassifierDecisionFromText,
+} from './classifierResponseFallback.js'
 import { parsePromptTooLongTokenCounts } from '../../services/api/errors.js'
 import { getDefaultMaxRetries } from '../../services/api/withRetry.js'
 import type { Tool, ToolPermissionContext, Tools } from '../../Tool.js'
@@ -832,6 +836,32 @@ async function classifyYoloActionXml(
       // In fast-only mode, stage 1 is final — handle block + unparseable here.
       if (mode === 'fast') {
         if (stage1Block === null) {
+          // Backends without forced-tool-call support answer in plain text
+          // (JSON / unclosed <block>). Recover the decision before the
+          // fail-closed branch; strict parse already failed so this only
+          // changes what was previously an unconditional deny.
+          const recoveredStage1 = parseClassifierDecisionFromText(stage1Text)
+          if (recoveredStage1) {
+            logForDebugging(
+              'Auto mode classifier (XML): recovered stage 1 decision from text',
+            )
+            logAutoModeOutcome('success', model, {
+              classifierType,
+              durationMs: stage1DurationMs,
+            })
+            return {
+              thinking: recoveredStage1.thinking || undefined,
+              shouldBlock: recoveredStage1.shouldBlock,
+              reason: recoveredStage1.reason || 'Recovered from text response',
+              model,
+              usage: stage1Usage,
+              durationMs: stage1DurationMs,
+              promptLengths,
+              stage: 'fast',
+              stage1RequestId,
+              stage1MsgId,
+            }
+          }
           logAutoModeOutcome('parse_failure', model, { classifierType })
           return {
             shouldBlock: true,
@@ -904,6 +934,34 @@ async function classifyYoloActionXml(
     )
 
     if (stage2Block === null) {
+      const recoveredStage2 = parseClassifierDecisionFromText(stage2Text)
+      if (recoveredStage2) {
+        logForDebugging(
+          'Auto mode classifier (XML): recovered stage 2 decision from text',
+        )
+        logAutoModeOutcome('success', model, {
+          classifierType,
+          durationMs: totalDurationMs,
+        })
+        return {
+          thinking: recoveredStage2.thinking || undefined,
+          shouldBlock: recoveredStage2.shouldBlock,
+          reason: recoveredStage2.reason || 'Recovered from text response',
+          model,
+          usage: totalUsage,
+          durationMs: totalDurationMs,
+          promptLengths,
+          stage: 'thinking',
+          stage1Usage,
+          stage1DurationMs,
+          stage1RequestId,
+          stage1MsgId,
+          stage2Usage,
+          stage2DurationMs,
+          stage2RequestId,
+          stage2MsgId,
+        }
+      }
       logAutoModeOutcome('parse_failure', model, { classifierType })
       return {
         shouldBlock: true,
@@ -1207,6 +1265,30 @@ export async function classifyYoloAction(
     )
 
     if (!toolUseBlock) {
+      // 200-response without a tool_use block: typical for vLLM backends
+      // whose tool-call parser cannot honor forced tool_choice. The model
+      // did answer — recover the decision from the text channel before
+      // falling into the fail-closed branch.
+      const recoveredFromText = parseClassifierDecisionFromText(
+        extractTextContent(result.content),
+      )
+      if (recoveredFromText) {
+        logForDebugging(
+          'Auto mode classifier: recovered decision from text (no tool_use block)',
+        )
+        logAutoModeOutcome('success', model, { durationMs })
+        return {
+          thinking: recoveredFromText.thinking,
+          shouldBlock: recoveredFromText.shouldBlock,
+          reason: recoveredFromText.reason || 'Recovered from text response',
+          model,
+          usage,
+          durationMs,
+          promptLengths,
+          stage1RequestId,
+          stage1MsgId,
+        }
+      }
       logForDebugging('Auto mode classifier: No tool use block found', {
         level: 'warn',
       })
@@ -1229,6 +1311,29 @@ export async function classifyYoloAction(
       yoloClassifierResponseSchema(),
     )
     if (!parsed) {
+      // tool_use exists but strict schema rejected it (e.g. string booleans
+      // from a lossy parser). Try lenient field normalization, then the text
+      // channel, before the fail-closed branch.
+      const lenient =
+        normalizeClassifierFields(toolUseBlock.input) ??
+        parseClassifierDecisionFromText(extractTextContent(result.content))
+      if (lenient) {
+        logForDebugging(
+          'Auto mode classifier: recovered decision from lenient parse (invalid strict schema)',
+        )
+        logAutoModeOutcome('success', model, { durationMs })
+        return {
+          thinking: lenient.thinking,
+          shouldBlock: lenient.shouldBlock,
+          reason: lenient.reason || 'Recovered from lenient parse',
+          model,
+          usage,
+          durationMs,
+          promptLengths,
+          stage1RequestId,
+          stage1MsgId,
+        }
+      }
       logForDebugging('Auto mode classifier: Invalid response schema', {
         level: 'warn',
       })
